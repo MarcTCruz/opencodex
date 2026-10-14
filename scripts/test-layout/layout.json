@@ -651,7 +651,7 @@
     "codex-log-guard-processes.test.ts": "codex-integration",
     "codex-log-guard-protection.test.ts": "codex-integration",
     "codex-log-guard-status-zero-write.test.ts": "codex-integration",
-    "codex-main-account-refresh.test.ts": "codex-integration", "native-main-credential-memory.test.ts": "codex-integration",
+    "codex-main-account-refresh.test.ts": "codex-integration", "native-main-credential-memory.test.ts": "codex-integration", "native-main-credential-literal-guard.test.ts": "codex-integration",
     "codex-main-rotation.test.ts": "codex-integration",
     "codex-management-convergence.test.ts": "codex-integration",
     "codex-metadata-integrity.test.ts": "codex-integration",
