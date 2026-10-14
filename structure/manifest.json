@@ -143,6 +143,15 @@
       ]
     },
     {
+      "path": "native-main-credentials.md",
+      "tier": 2,
+      "title": "Native Main Credentials",
+      "scope": "In-memory native-main auth observation, publication, and confirmed deletion.",
+      "documents": [
+        "src/codex/"
+      ]
+    },
+    {
       "path": "codex-prompts.md",
       "tier": 2,
       "title": "Codex Prompts",

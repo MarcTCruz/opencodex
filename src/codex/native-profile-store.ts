@@ -83,6 +83,12 @@ export interface NativeEnvelopeSnapshot {
   text: string;
   digest: string;
   accountId: string;
+  nativeMainAuthFence?: {
+    digest: string;
+    identity: { dev: number; ino: number };
+    observationGeneration: number;
+  };
+  isSymlink?: boolean;
 }
 
 export type NativeEnvelopeReadResult =
@@ -377,7 +383,7 @@ export function resolveNativeProfileContext(options: { codexHome?: string; confi
   };
 }
 
-export function readBounded(path: string, limit: number, testSeam?: BoundedReadTestSeam): Buffer {
+function readBounded(path: string, limit: number, testSeam?: BoundedReadTestSeam): Buffer {
   let fd: number | undefined;
   let failed = false;
   try {

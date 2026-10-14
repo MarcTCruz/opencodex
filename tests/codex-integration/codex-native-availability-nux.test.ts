@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { writeNativeMainAuthFileForTests } from "../helpers/native-main-auth";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { captureCatalogAdmissionSnapshot } from "../../src/codex/catalog-admission";
 import { loadBundledCodexCatalog, resetCatalogRuntimeStateForTests, syncCatalogModels } from "../../src/codex/catalog";
@@ -16,6 +17,16 @@ import {
   type CodexModelEntitlementCredentialSnapshot,
 } from "../../src/codex/model-entitlements";
 import { resetCodexRuntimeResolveCacheForTests } from "../../src/codex/runtime";
+import { clearMainAccountInfoCache } from "../../src/codex/main-account-cache";
+import { resetMainCodexAccountIdentityTrackingForTests } from "../../src/codex/account-lifecycle";
+import { setMainAccountPlan } from "../../src/codex/main-account";
+import {
+  initializeNativeMainStartupGate,
+  nativeMainStartupGateSnapshot,
+} from "../../src/codex/native-profile-startup";
+import { stopNativeMainCredentialWatchers } from "../../src/codex/native-main-credentials";
+import { resetLifecycleDrainStateForTests } from "../../src/server/lifecycle";
+import { resetOptionalShutdownHooksForTests } from "../../src/lib/optional-shutdown-hooks";
 import { saveConfig } from "../../src/config";
 import { CODEX_FORWARD_BASE_URL } from "../../src/providers/openai-tiers";
 import type { OcxConfig } from "../../src/types";
@@ -121,16 +132,10 @@ test("hidden rows and failed or unlisted main rosters cannot retain a prompt", a
   expect(row.availability_nux).toBeNull();
 });
 
-let home: TempHome | undefined;
-let previousCliPath: string | undefined;
-let previousFetch: typeof fetch;
-let mainPrompt: unknown;
-let poolPrompt: unknown;
-
 function writerConfig(): OcxConfig {
   return {
     port: 10100,
-    providers: { openai: { adapter: "openai-responses", baseUrl: CODEX_FORWARD_BASE_URL, authMode: "forward" } },
+    providers: { openai: { adapter: "openai-responses", baseUrl: CODEX_FORWARD_BASE_URL, authMode: "forward", upstreamWebsocket: false,} },
     defaultProvider: "openai",
     codexAccounts: [{ id: "synthetic-pool", email: "pool@example.test", alias: "Pool", isMain: false }],
     codexAccountNamespaces: { desktop: "@main", team: "synthetic-pool" },
@@ -139,12 +144,12 @@ function writerConfig(): OcxConfig {
   };
 }
 
-function writtenRows(): RawEntry[] {
-  return (JSON.parse(readFileSync(join(home!.codexHome, "opencodex-catalog.json"), "utf8")) as RawCatalog).models ?? [];
+function writtenRows(home: TempHome): RawEntry[] {
+  return (JSON.parse(readFileSync(join(home.codexHome, "opencodex-catalog.json"), "utf8")) as RawCatalog).models ?? [];
 }
 
-function primeWriter(): void {
-  const runtimeScript = home!.path("codex-fixture.js");
+function primeWriter(home: TempHome): void {
+  const runtimeScript = home.path("codex-fixture.js");
   const bundled = JSON.stringify({ models: [{
     slug: "gpt-5.5", display_name: "GPT-5.5", description: "Fixture native",
     priority: 1, visibility: "list", base_instructions: "You are Codex.",
@@ -155,7 +160,7 @@ function primeWriter(): void {
     'if (process.argv.includes("--version")) console.log("codex-cli 0.145.0");',
     `else process.stdout.write(${JSON.stringify(bundled)});`,
   ].join("\n"));
-  const runtimeCommand = home!.path(process.platform === "win32" ? "codex-fixture.cmd" : "codex-fixture");
+  const runtimeCommand = home.path(process.platform === "win32" ? "codex-fixture.cmd" : "codex-fixture");
   writeFileSync(runtimeCommand, process.platform === "win32"
     ? `@echo off\r\n"${process.execPath}" "${runtimeScript}" %*\r\n`
     : `#!/bin/sh\nexec "${process.execPath}" "${runtimeScript}" "$@"\n`);
@@ -166,7 +171,7 @@ function primeWriter(): void {
   expect(loadBundledCodexCatalog()?.models?.[0]?.slug).toBe("gpt-5.5");
 }
 
-async function writeWith(writer: "retained" | "convergence", config: OcxConfig): Promise<RawEntry[]> {
+async function writeWith(home: TempHome, writer: "retained" | "convergence", config: OcxConfig): Promise<RawEntry[]> {
   saveConfig(config);
   if (writer === "retained") await syncCatalogModels(config);
   else {
@@ -175,41 +180,57 @@ async function writeWith(writer: "retained" | "convergence", config: OcxConfig):
     if (gathered.kind !== "candidate") throw new Error("expected candidate");
     expect((await commitCodexCatalogCandidate(gathered.candidate, 1_000)).kind).toBe("committed");
   }
-  return writtenRows();
+  return writtenRows(home);
 }
 
 test.each(["retained", "convergence"] as const)("%s writes and later clears main-only NUX in the on-disk catalog", async writer => {
-  previousCliPath = process.env.CODEX_CLI_PATH;
-  previousFetch = globalThis.fetch;
-  home = createTempHome("ocx-native-nux-");
-  mkdirSync(home.codexHome);
-  writeFileSync(join(home.codexHome, "auth.json"), JSON.stringify({
-    tokens: { access_token: "synthetic-main-token", account_id: "synthetic-main-account" },
-  }));
-  saveCodexAccountCredential("synthetic-pool", {
-    accessToken: "synthetic-pool-token", refreshToken: "synthetic-pool-refresh",
-    expiresAt: Date.now() + 300_000, chatgptAccountId: "synthetic-pool-account",
-  });
-  globalThis.fetch = (async (input, init) => {
-    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input : input.url);
-    if (url.hostname === "chatgpt.com" && url.pathname.endsWith("/models")) {
-      const id = new Headers(init?.headers).get("chatgpt-account-id");
-      return Response.json({ models: [rosterRow(WRITER_MODEL,
-        id === "synthetic-main-account" ? mainPrompt : poolPrompt)] });
-    }
-    return previousFetch(input, init);
-  }) as typeof fetch;
+  const previousCliPath = process.env.CODEX_CLI_PATH;
+  const previousFetch = globalThis.fetch;
+  const home = createTempHome("ocx-native-nux-");
   try {
-    mainPrompt = { message: "Main trial" };
-    poolPrompt = { message: "Pool trial" };
-    primeWriter();
+    expect(readdirSync(home.root)).toEqual([]);
+    expect(existsSync(home.codexHome)).toBe(false);
+    mkdirSync(home.codexHome);
+    expect(readdirSync(home.codexHome)).toEqual([]);
+    stopNativeMainCredentialWatchers();
+    resetOptionalShutdownHooksForTests();
+    resetLifecycleDrainStateForTests();
+    clearMainAccountInfoCache();
+    resetMainCodexAccountIdentityTrackingForTests();
+    setMainAccountPlan(null);
+    const startup = await initializeNativeMainStartupGate();
+    expect(startup.status).toBe("ready");
+    expect(startup).toEqual(nativeMainStartupGateSnapshot());
+    let mainPrompt: unknown = { message: "Main trial" };
+    const poolPrompt: unknown = { message: "Pool trial" };
+    writeNativeMainAuthFileForTests(join(home.codexHome, "auth.json"), JSON.stringify({
+      tokens: {
+        access_token: "synthetic-main-token",
+        refresh_token: "synthetic-main-refresh",
+        account_id: "synthetic-main-account",
+      },
+    }));
+    saveCodexAccountCredential("synthetic-pool", {
+      accessToken: "synthetic-pool-token", refreshToken: "synthetic-pool-refresh",
+      expiresAt: Date.now() + 300_000, chatgptAccountId: "synthetic-pool-account",
+    });
+    globalThis.fetch = (async (input, init) => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input : input.url);
+      if (url.hostname === "chatgpt.com" && url.pathname.endsWith("/models")) {
+        const id = new Headers(init?.headers).get("chatgpt-account-id");
+        return Response.json({ models: [rosterRow(WRITER_MODEL,
+          id === "synthetic-main-account" ? mainPrompt : poolPrompt)] });
+      }
+      return previousFetch(input, init);
+    }) as typeof fetch;
+    primeWriter(home);
     writeFileSync(join(home.codexHome, "opencodex-catalog.json"), JSON.stringify({
       models: [{ slug: WRITER_MODEL, display_name: "Sol", visibility: "list", priority: 1,
         supported_reasoning_levels: [{ effort: "medium", description: "Medium" }],
         availability_nux: { message: "Old prompt" } }],
     }));
     const config = writerConfig();
-    let rows = await writeWith(writer, config);
+    let rows = await writeWith(home, writer, config);
     expect(rows.find(row => row.slug === WRITER_MODEL)?.availability_nux).toEqual({ message: "Main trial" });
     expect(JSON.stringify(rows)).not.toContain("Pool trial");
     for (const slug of [`desktop/${WRITER_MODEL}`, `team/${WRITER_MODEL}`]) {
@@ -217,7 +238,7 @@ test.each(["retained", "convergence"] as const)("%s writes and later clears main
     }
     mainPrompt = undefined;
     resetCodexModelEntitlementCacheForTests();
-    rows = await writeWith(writer, config);
+    rows = await writeWith(home, writer, config);
     expect(rows.find(row => row.slug === WRITER_MODEL)?.availability_nux).toBeNull();
     for (const slug of [`desktop/${WRITER_MODEL}`, `team/${WRITER_MODEL}`]) {
       expect(rows.find(row => row.slug === slug)).not.toHaveProperty("availability_nux");
@@ -226,7 +247,7 @@ test.each(["retained", "convergence"] as const)("%s writes and later clears main
       alias: WRITER_MODEL, nativeAlias: true, displayName: "Synthetic alias",
       targets: [{ provider: "openai", model: WRITER_MODEL }],
     } };
-    rows = await writeWith(writer, config);
+    rows = await writeWith(home, writer, config);
     const alias = rows.find(row => row.slug === WRITER_MODEL);
     expect(alias?.opencodex_catalog_kind).toBe(CODEX_NATIVE_ALIAS_CATALOG_KIND);
     expect(alias).not.toHaveProperty("availability_nux");
@@ -234,9 +255,20 @@ test.each(["retained", "convergence"] as const)("%s writes and later clears main
     globalThis.fetch = previousFetch;
     if (previousCliPath === undefined) delete process.env.CODEX_CLI_PATH;
     else process.env.CODEX_CLI_PATH = previousCliPath;
+    resetCodexModelEntitlementCacheForTests();
+    resetCatalogRuntimeStateForTests();
     resetCodexRuntimeResolveCacheForTests();
+    stopNativeMainCredentialWatchers();
+    resetOptionalShutdownHooksForTests();
+    resetLifecycleDrainStateForTests();
+    clearMainAccountInfoCache();
+    resetMainCodexAccountIdentityTrackingForTests();
+    setMainAccountPlan(null);
+    await initializeNativeMainStartupGate({
+      manager: { context: { homeId: null } } as never,
+      probeRecoveryState: () => "none",
+    });
     home.remove();
-    home = undefined;
   }
 });
 

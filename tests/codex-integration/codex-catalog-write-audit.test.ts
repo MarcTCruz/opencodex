@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync, symlinkSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync, symlinkSync } from "node:fs";
 import * as fs from "node:fs";
 import * as secretAcl from "../../src/lib/windows-secret-acl";
 import { tmpdir } from "node:os";
@@ -282,6 +282,7 @@ describe("bounded audit descriptors and privacy", () => {
     expect(replaceAs("restore", catalogBytes(native, routed))).toEqual({ kind: "written" });
     rmSync(auditPath(), { recursive: true });
     writeFileSync(auditPath(), '{}\n', { mode: 0o644 });
+    chmodSync(auditPath(), 0o644);
     expect(replaceAs("restore", catalogBytes(native))).toEqual({ kind: "written" });
     expect(readFileSync(auditPath(), "utf8")).toBe('{}\n');
     if (process.platform !== "win32") {

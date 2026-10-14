@@ -1,9 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { lstatSync, unlinkSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { atomicWriteFile, getConfigDir, getConfigPath, mutatePersistedConfig, readConfigDiagnostics, withConfigMutationLockSync } from "../config";
 import { readAlivePid, readRuntimePort } from "../config/process-state";
 import { getCodexHome } from "./paths";
+import {
+  observeNativeMainAuthFile,
+  nativeMainAuthStrictNoFollowAllowed,
+} from "./native-main-credentials";
 import { advanceCodexCredentialMutationEpoch } from "./credential-mutation-epoch";
 import { assertPlainLocalPath, ORCA_ACCOUNT_DIRECTORY, parseOrcaAuth, readBoundedLocalFile, readOrcaAuthSource, sameLocalPath } from "./orca-auth-source";
 
@@ -56,6 +60,43 @@ function assertStopped(): void {
   if (running) throw new OrcaImportError("Stop the opencodex proxy before applying an Orca import.");
 }
 
+export function observeOrcaMainAuthMemory(authPath: string) {
+  try {
+    assertPlainLocalPathThroughExistingPrefix(authPath);
+  } catch {
+    throw new OrcaImportError("Main Codex identity is unknown; import refused.");
+  }
+  const observation = observeNativeMainAuthFile(authPath);
+  let pathIsPlain = true;
+  try {
+    assertPlainLocalPathThroughExistingPrefix(authPath);
+  } catch {
+    pathIsPlain = false;
+  }
+  if (!pathIsPlain || observation.status === "stopped"
+    || observation.status === "ok" && !nativeMainAuthStrictNoFollowAllowed(observation)) {
+    observation.snapshot?.raw.fill(0);
+    observation.raw?.fill(0);
+    throw new OrcaImportError("Main Codex identity is unknown; import refused.");
+  }
+  return observation;
+}
+
+function assertPlainLocalPathThroughExistingPrefix(path: string): void {
+  let candidate = resolve(path);
+  while (true) {
+    try {
+      assertPlainLocalPath(candidate);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = dirname(candidate);
+      if (parent === candidate) throw error;
+      candidate = parent;
+    }
+  }
+}
+
 function prepare(sourceDir: string, registryPath: string) {
   const configRaw = optionalFile(getConfigPath());
   if (!configRaw || readConfigDiagnostics().source !== "file") {
@@ -101,7 +142,23 @@ function prepare(sourceDir: string, registryPath: string) {
       recoverable.set(credential.chatgptAccountId, { id, credential });
     }
   }
-  const mainRaw = optionalFile(join(getCodexHome(), "auth.json"));
+  const mainObservation = observeOrcaMainAuthMemory(join(getCodexHome(), "auth.json"));
+  if (mainObservation.status === "stopped") {
+    throw new OrcaImportError("Main Codex identity is unknown; import refused.");
+  }
+  if (mainObservation.status === "unreadable") {
+    throw new OrcaImportError("A target or main credential file is unreadable; import refused.");
+  }
+  if (mainObservation.status === "invalid" || mainObservation.fileStatus === "invalid") {
+    throw new OrcaImportError("Main Codex identity is unknown; import refused.");
+  }
+  if ((mainObservation.status !== "ok" || mainObservation.fileStatus !== "valid")
+    && !(mainObservation.status === "missing" && mainObservation.deletionConfirmed)) {
+    throw new OrcaImportError("Main Codex identity is not confirmed; import refused.");
+  }
+  const mainRaw = mainObservation.snapshot?.raw.toString("utf-8");
+  mainObservation.snapshot?.raw.fill(0);
+  mainObservation.raw?.fill(0);
   if (mainRaw !== undefined) {
     const main = object(JSON.parse(mainRaw));
     if (main.tokens !== undefined) {

@@ -1,11 +1,14 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { writeNativeMainAuthFileForTests } from "../helpers/native-main-auth";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { loadConfig, saveConfig, setPersistedConfigMutationBeforeCommitForTests } from "../../src/config";
 import { parseOrcaAuth, readBoundedLocalFile, assertPlainLocalPath } from "../../src/codex/orca-auth-source";
-import { importOrcaAccounts } from "../../src/codex/orca-import";
+import { importOrcaAccounts, observeOrcaMainAuthMemory } from "../../src/codex/orca-import";
+import { getNativeMainAuthMemory, stopNativeMainCredentialWatchers } from "../../src/codex/native-main-credentials";
+import { resetOptionalShutdownHooksForTests, runOptionalShutdownHooks } from "../../src/lib/optional-shutdown-hooks";
 import { capturePoolQuotaWriter, forceRefreshCodexPoolToken, getCodexAccountCredential, getValidCodexToken, isPoolQuotaWriterLive, markCodexAccountValidated, poolQuotaHistoryIdentity, readCodexAccountRecord } from "../../src/codex/account-store";
 import { setAsyncIcaclsRunnerForTests, setIcaclsRunnerForTests } from "../../src/lib/windows-secret-acl";
 import { flushConfigDirHardeningForTests } from "../../src/config/paths";
@@ -40,6 +43,7 @@ function store() { return JSON.parse(readFileSync(join(target, "codex-accounts.j
 function importedId() { return Object.keys(store())[0]!; }
 
 beforeEach(() => {
+  resetOptionalShutdownHooksForTests();
   originalHome = process.env.OPENCODEX_HOME;
   originalCodexHome = process.env.CODEX_HOME;
   const ok = { success: true, exitCode: 0, timedOut: false, stdout: "" };
@@ -53,8 +57,11 @@ beforeEach(() => {
   writeFileSync(registry, JSON.stringify({ settings: { codexManagedAccounts: [] } }));
   process.env.OPENCODEX_HOME = target; process.env.CODEX_HOME = main;
   saveConfig(loadConfig());
+  writeNativeMainAuthFileForTests(join(main, "auth.json"), auth("main-existing"));
 });
 afterEach(async () => {
+  stopNativeMainCredentialWatchers();
+  resetOptionalShutdownHooksForTests();
   await flushConfigDirHardeningForTests();
   setIcaclsRunnerForTests(null); setAsyncIcaclsRunnerForTests(null);
   setPersistedConfigMutationBeforeCommitForTests(null);
@@ -89,10 +96,45 @@ describe("offline Orca import", () => {
   });
   test("deduplicates main and orphan credential records", () => {
     addSource(auth("main-identity")); addSource(auth("orphan-identity"));
-    writeFileSync(join(main, "auth.json"), auth("main-identity"));
+    writeNativeMainAuthFileForTests(join(main, "auth.json"), auth("main-identity"));
     writeFileSync(join(target, "codex-accounts.json"), JSON.stringify({ orphan: {
       accessToken: "fixture", refreshToken: "fixture", expiresAt: 0, chatgptAccountId: "orphan-identity" } }));
     expect(importOrcaAccounts({ sourceDir: source, registryPath: registry, apply: true })).toMatchObject({ eligible: 0, duplicates: 2, imported: 0 });
+  });
+  test("main identity reads reject a symlinked auth.json", () => {
+    addSource();
+    const authPath = join(main, "auth.json");
+    const linkedPath = join(main, "linked-main-auth.json");
+    const external = auth("main-identity");
+    writeFileSync(linkedPath, external);
+    unlinkSync(authPath);
+    symlinkSync(linkedPath, authPath);
+
+    expect(() => importOrcaAccounts({ sourceDir: source, registryPath: registry })).toThrow("Main Codex identity is unknown; import refused.");
+    expect(lstatSync(authPath).isSymbolicLink()).toBe(true);
+    expect(readFileSync(linkedPath, "utf8")).toBe(external);
+  });
+  test("main identity reads reject a resolved parent replaced by a symlink", () => {
+    const authPath = join(main, "auth.json");
+    writeNativeMainAuthFileForTests(authPath, auth("main-identity"));
+    const warm = getNativeMainAuthMemory(authPath);
+    warm.snapshot?.raw.fill(0);
+    warm.raw?.fill(0);
+
+    const moved = join(scratch, "moved-main");
+    renameSync(main, moved);
+    symlinkSync(moved, main, process.platform === "win32" ? "junction" : "dir");
+
+    expect(() => observeOrcaMainAuthMemory(authPath))
+      .toThrow("Main Codex identity is unknown; import refused.");
+    expect(lstatSync(main).isSymbolicLink()).toBe(true);
+    expect(readFileSync(join(moved, "auth.json"), "utf8")).toBe(auth("main-identity"));
+  });
+  test("stopped main-auth memory refuses Orca preparation", () => {
+    addSource();
+    runOptionalShutdownHooks();
+    expect(() => importOrcaAccounts({ sourceDir: source, registryPath: registry }))
+      .toThrow("Main Codex identity is unknown; import refused.");
   });
   test("retry completes interrupted registration using the same untouched credential record", () => {
     const path = addSource();
@@ -126,7 +168,7 @@ describe("offline Orca import", () => {
     if (scenario === "path") record.credential.sourceAuthPath = join(source, "other", "auth.json");
     if (scenario === "refresh-grant") record.credential.refreshToken = "synthetic-owned-grant";
     if (scenario === "another-orphan") records.ordinary = { ...record };
-    if (scenario === "main") writeFileSync(join(main, "auth.json"), auth());
+    if (scenario === "main") writeNativeMainAuthFileForTests(join(main, "auth.json"), auth());
     const before = JSON.stringify(records, null, 2) + "\n";
     writeFileSync(join(target, "codex-accounts.json"), before);
     expect(importOrcaAccounts(options)).toMatchObject({ imported: 0, eligible: 0, duplicates: 1 });
@@ -138,7 +180,7 @@ describe("offline Orca import", () => {
     expect(importOrcaAccounts({ sourceDir: source, registryPath: registry })).toMatchObject({
       invalid: 2, eligible: 0, invalidReasons: { source_invalid: 2 },
     });
-    writeFileSync(join(main, "auth.json"), "not json");
+    writeNativeMainAuthFileForTests(join(main, "auth.json"), "not json");
     expect(() => importOrcaAccounts({ sourceDir: source, registryPath: registry, apply: true })).toThrow();
   });
   test("reports fixed reason codes without source details", () => {

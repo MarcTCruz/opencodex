@@ -11,7 +11,7 @@ function plan(source: string, target: ReturnType<typeof routingTarget>) {
     catalogPathOption: null,
     journalReadOnly: true,
   });
-  expect(derived.kind).toBe("ok");
+  expect(derived.kind === "ok" ? derived.kind : derived.message).toBe("ok");
   if (derived.kind !== "ok") throw new Error("plan refused");
   return derived;
 }

@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { getCodexAccountCredential } from "./account-store";
 import { loadConfig } from "../config";
@@ -6,7 +5,10 @@ import { resolveCodexHomeDir } from "./home";
 import { extractAccountId } from "../oauth/chatgpt";
 import { isSelectableCodexPoolAccount } from "./account-id";
 import { codexPlanKey } from "./plan";
-import { MAX_AUTH_BYTES, readBounded } from "./native-profile-store";
+import {
+  getNativeMainAuthMemory,
+  nativeMainAuthStrictNoFollowAllowed,
+} from "./native-main-credentials";
 
 export interface CodexTokens {
   access_token: string;
@@ -24,32 +26,29 @@ export type CodexTokenReadResult =
   | { status: "ok"; tokens: CodexTokens }
   | { status: "missing" | "invalid" | "unreadable" };
 
-function hasErrnoCode(error: unknown, code: string): boolean {
-  return typeof error === "object" && error !== null && "code" in error
-    && (error as { code?: unknown }).code === code;
-}
-
 /**
- * Reads the Codex CLI credential file and classifies the outcome. Reads once instead of doing an
- * `existsSync` pre-check, so a file replaced between check and read cannot be misread as absent.
- * An already-owned lifecycle may supply its pinned auth path instead of resolving ambient home.
- * `bounded` opts into the native-profile bounded reader (regular file, size-capped, no-follow,
- * non-blocking) for startup observation paths that run inside the owner claim; bounded violations
- * classify as `unreadable`. Legacy callers keep the unbounded read.
- * Never returns or logs the raw error or any token material.
+ * Classifies the native-main credential from the in-memory store. An already-owned lifecycle may
+ * supply its pinned auth path instead of resolving ambient home. File observation and bounds are
+ * owned by the central store; bounded callers also retain the prior no-follow symlink policy.
+ * Never returns or logs raw file errors or token material.
  */
 export function readCodexTokensResult(
   authPath = join(resolveCodexHomeDir(), "auth.json"),
   options?: { bounded?: boolean },
 ): CodexTokenReadResult {
-  let raw: string;
-  try {
-    raw = options?.bounded === true
-      ? readBounded(authPath, MAX_AUTH_BYTES).toString("utf-8")
-      : readFileSync(authPath, "utf-8");
-  } catch (error) {
-    return { status: hasErrnoCode(error, "ENOENT") ? "missing" : "unreadable" };
+  const observation = getNativeMainAuthMemory(authPath);
+  if (observation.status !== "ok" || !observation.snapshot) {
+    const status = observation.status === "missing" || observation.status === "invalid"
+      ? observation.status
+      : "unreadable";
+    return { status };
   }
+  if (options?.bounded && !nativeMainAuthStrictNoFollowAllowed(observation)) {
+    observation.snapshot.raw.fill(0);
+    observation.raw?.fill(0);
+    return { status: "unreadable" };
+  }
+  const raw = observation.snapshot.raw.toString("utf-8");
   try {
     const j = JSON.parse(raw) as {
       tokens?: { access_token?: string; account_id?: string; id_token?: string };
@@ -65,6 +64,9 @@ export function readCodexTokensResult(
     };
   } catch {
     return { status: "invalid" };
+  } finally {
+    observation.snapshot.raw.fill(0);
+    observation.raw?.fill(0);
   }
 }
 

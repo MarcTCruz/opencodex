@@ -1,11 +1,24 @@
-import { appendFileSync, realpathSync } from "node:fs";
+import {
+  appendFileSync,
+  chmodSync,
+  closeSync,
+  fchmodSync,
+  fsyncSync,
+  openSync,
+  realpathSync,
+  renameSync,
+  truncateSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 
-import { atomicWriteFileAsync } from "../../src/config";
 import { MAIN_CODEX_ACCOUNT_ID } from "../../src/codex/main-account";
 import { nativeMainOwnerSnapshot } from "../../src/codex/native-main-owner";
 import { NativeProfileManager } from "../../src/codex/native-profile-manager";
+import { renameAtomicFile } from "../../src/lib/windows-atomic-replace";
+import { hardenSecretPathAsync } from "../../src/lib/windows-secret-acl";
 import {
   nativeMainStartupGateSnapshot,
 } from "../../src/codex/native-profile-startup";
@@ -52,15 +65,43 @@ function managerFor(home = codexHome): NativeProfileManager {
     keyProvider: new EnvKeyProvider(),
     hardenPath: async () => {},
     processProbe: async () => ({ status: "clear", count: 0 }),
-    atomicWrite: holdAuthTemp
-      ? (path, content) => atomicWriteFileAsync(path, content, undefined, {
-          afterTempWrite: async tempPath => {
-            if (resolve(path) !== resolve(canonicalAuthPath)) return;
-            emit({ event: "auth-temp-written", name: basename(tempPath) });
-            await authTempBarrier;
+    nativeAuthWriteIO: holdAuthTemp ? {
+      write: async (tempPath, content) => {
+        const descriptor = openSync(tempPath, "wx", 0o600);
+        try {
+          if (process.platform !== "win32") fchmodSync(descriptor, 0o600);
+          writeFileSync(descriptor, content, { encoding: "utf8" });
+          fsyncSync(descriptor);
+        } finally {
+          closeSync(descriptor);
+        }
+        if (!resolve(tempPath).startsWith(`${resolve(canonicalAuthPath)}.ocx.`)) return;
+        emit({ event: "auth-temp-written", name: basename(tempPath) });
+        await authTempBarrier;
+      },
+      harden: async tempPath => {
+        if (process.platform === "win32") {
+          await hardenSecretPathAsync(tempPath, { required: true, timeoutMemoKey: canonicalAuthPath });
+          return;
+        }
+        chmodSync(tempPath, 0o600);
+      },
+      rename: (source, destination, afterReplace) => renameAtomicFile(
+        source,
+        destination,
+        {
+          platform: process.platform,
+          rename: (from, to) => {
+            renameSync(from, to);
+            afterReplace?.();
           },
-        })
-      : undefined,
+          sleep: Bun.sleepSync,
+        },
+        "config",
+      ),
+      truncate: target => truncateSync(target, 0),
+      unlink: unlinkSync,
+    } : undefined,
     onSwitchBoundary: async boundary => {
       if (boundary !== holdSwitchBoundary) return;
       emit({ event: "switch-boundary", boundary });

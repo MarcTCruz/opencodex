@@ -20,6 +20,7 @@ import { clearCodexPoolRefreshFailure } from "./pool-refresh-backoff";
 import { invalidateCodexWebSocketsForAccount } from "./websocket-registry";
 import { clearMainAccountCredentialPresence, clearMainAccountInfoCache, observeMainQuotaCredential, observeMainQuotaIdentity } from "./main-account-cache";
 import { extractAccountId, extractAccountIdClaims } from "../oauth/chatgpt";
+import { observeNativeMainAuthFile } from "./native-main-credentials";
 import { forgetCodexAccountPause } from "./account-pause";
 import { forgetCodexAccountCreditUse } from "./account-credit-use";
 import { setCodexAccountUseRemainingQuota } from "./account-use-remaining";
@@ -101,8 +102,12 @@ export function reconcileMainCodexAccountRuntimeState(): boolean {
  * Only a valid replacement observation or confirmed account transition supersedes that evidence.
  */
 export function initializeMainAccountPolicyBinding(authPath: string): boolean {
-  // Startup observes the pinned owned path inside the exclusive claim: bound the read so a
-  // replaced non-regular or oversized file cannot stall startup inside that claim.
+  // Startup observes the pinned owned path inside the exclusive claim. The observer's bounded
+  // read is the only credential-file read; every policy consumer below uses its memory copy.
+  const observed = observeNativeMainAuthFile(authPath);
+  observed.raw?.fill(0);
+  observed.snapshot?.raw.fill(0);
+  if (!observed.canRefreshOrWrite) return false;
   const result = readCodexTokensResult(authPath, { bounded: true });
   if (result.status !== "ok") return false;
   const { tokens } = result;

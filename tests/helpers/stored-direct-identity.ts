@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
-import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { materializeCodexUpstreamAuth, materializeCodexUpstreamAuthAsync } from "../../src/codex/auth-context";
+import { writeNativeMainAuthFileForTests } from "./native-main-auth";
 
 export function registerStoredDirectIdentityTests(getTestDir: () => string, liveJwt: () => string): void {
   test("an admission bearer on main substitutes the stored credential, never forwards it (#1686)", () => {
@@ -9,8 +9,8 @@ export function registerStoredDirectIdentityTests(getTestDir: () => string, live
     // process, so the only acceptable outcome is the stored main credential in its place.
     const admissionSecret = "ocx_data_localsecret";
     const storedCredential = liveJwt();
-    writeFileSync(join(getTestDir(), "auth.json"), JSON.stringify({
-      tokens: { access_token: storedCredential, account_id: "stored_main_acc" },
+    writeNativeMainAuthFileForTests(join(getTestDir(), "auth.json"), JSON.stringify({
+      tokens: { access_token: storedCredential, refresh_token: "stored-main-refresh", account_id: "stored_main_acc" },
     }));
 
     const headers = materializeCodexUpstreamAuth(
@@ -28,8 +28,8 @@ export function registerStoredDirectIdentityTests(getTestDir: () => string, live
 
   test("sync stored Direct substitution clears a missing account ID without changing inbound headers", () => {
     const storedCredential = liveJwt();
-    writeFileSync(join(getTestDir(), "auth.json"), JSON.stringify({
-      tokens: { access_token: storedCredential },
+    writeNativeMainAuthFileForTests(join(getTestDir(), "auth.json"), JSON.stringify({
+      tokens: { access_token: storedCredential, refresh_token: "stored-main-refresh" },
     }));
     const inbound = new Headers({
       authorization: "Bearer ocx_data_localsecret",
@@ -55,8 +55,8 @@ export function registerStoredDirectIdentityTests(getTestDir: () => string, live
     ["present", "stored_main_acc", "stored_main_acc"],
   ])("async stored Direct substitution owns account identity when %s", async (_label, accountId, expectedAccountId) => {
     const storedCredential = liveJwt();
-    writeFileSync(join(getTestDir(), "auth.json"), JSON.stringify({
-      tokens: { access_token: storedCredential, account_id: accountId },
+    writeNativeMainAuthFileForTests(join(getTestDir(), "auth.json"), JSON.stringify({
+      tokens: { access_token: storedCredential, refresh_token: "stored-main-refresh", account_id: accountId },
     }));
     const inbound = new Headers({
       authorization: "Bearer ocx_data_localsecret",

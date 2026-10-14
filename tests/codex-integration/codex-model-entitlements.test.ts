@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { writeNativeMainAuthFileForTests } from "../helpers/native-main-auth";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -529,9 +530,10 @@ describe("ensureCodexEntitlementFreshness", () => {
   };
 
   const writeMainAuth = (suffix: string): void => {
-    writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
+    writeNativeMainAuthFileForTests(join(codexHome, "auth.json"), JSON.stringify({
       tokens: {
         access_token: `access-${suffix}`,
+        refresh_token: `refresh-${suffix}`,
         account_id: `chatgpt-${suffix}`,
       },
     }));
@@ -661,7 +663,7 @@ describe("ensureCodexEntitlementFreshness", () => {
   });
 
   test("a same-identity main-token write invalidates a failed credential memo by epoch", async () => {
-    writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
+    writeNativeMainAuthFileForTests(join(codexHome, "auth.json"), JSON.stringify({
       tokens: {
         access_token: "access-memo-same",
         refresh_token: "refresh-memo-same",
@@ -701,7 +703,7 @@ describe("ensureCodexEntitlementFreshness", () => {
   });
 
   test("a local write after absence observation fences stale negative-memo publication by epoch", async () => {
-    writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
+    writeNativeMainAuthFileForTests(join(codexHome, "auth.json"), JSON.stringify({
       tokens: {
         access_token: "access-publication-local",
         refresh_token: "refresh-publication-local",
@@ -855,7 +857,7 @@ describe("ensureCodexEntitlementFreshness", () => {
   });
 
   test("a same-identity main-token write cannot join its pre-write roster flight", async () => {
-    writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
+    writeNativeMainAuthFileForTests(join(codexHome, "auth.json"), JSON.stringify({
       tokens: {
         access_token: "access-same-identity",
         refresh_token: "refresh-same-identity",

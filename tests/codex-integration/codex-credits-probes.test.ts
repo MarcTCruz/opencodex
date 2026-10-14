@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { writeNativeMainAuthFileForTests } from "../helpers/native-main-auth";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,8 +25,8 @@ const account: CodexAccount = { id: "credits-pool", email: "credits@example.test
 const config = (): OcxConfig => ({ port: 10100, defaultProvider: "openai", providers: {}, codexAccounts: [] });
 
 function writeMain(bearer = "fixture-main-bearer", identity = "fixture-main-identity") {
-  writeFileSync(join(process.env.CODEX_HOME!, "auth.json"), JSON.stringify({
-    tokens: { access_token: bearer, account_id: identity },
+  writeNativeMainAuthFileForTests(join(process.env.CODEX_HOME!, "auth.json"), JSON.stringify({
+    tokens: { access_token: bearer, refresh_token: "fixture-main-refresh", account_id: identity },
   }));
 }
 function poolContext() {

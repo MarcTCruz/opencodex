@@ -1,6 +1,5 @@
 import { clearAccountNeedsReauth, markAccountNeedsReauth } from "../../src/codex/account-runtime-state";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import * as fs from "node:fs";
 import { mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +10,7 @@ import {
   type CodexAuthContext,
 } from "../../src/codex/auth-context";
 import { getMainAccountToken, MAIN_CODEX_ACCOUNT_ID } from "../../src/codex/main-account";
+import * as nativeMainCredentials from "../../src/codex/native-main-credentials";
 import { clearMainAccountInfoCache } from "../../src/codex/main-account-cache";
 import {
   resetCodexModelEntitlementCacheForTests,
@@ -72,9 +72,9 @@ const originalNow = Date.now;
 let testDir = "";
 let previousOpenCodexHome: string | undefined;
 let previousCodexHome: string | undefined;
-let authJsonReads = 0;
-let authJsonReadStacks: string[] = [];
-let readSpy: ReturnType<typeof spyOn> | undefined;
+let nativeMainMemoryReads = 0;
+let nativeMainMemoryReadStacks: string[] = [];
+let nativeMainReadSpy: ReturnType<typeof spyOn> | undefined;
 let blockedHomeId: string | null = null;
 
 function providerConfig(overrides: Partial<OcxConfig> = {}): OcxConfig {
@@ -90,6 +90,7 @@ function providerConfig(overrides: Partial<OcxConfig> = {}): OcxConfig {
         baseUrl: "https://chatgpt.com/backend-api/codex",
         authMode: "forward",
         codexAccountMode: "pool",
+        upstreamWebsocket: false,
       },
       xai: {
         adapter: "openai-chat",
@@ -137,13 +138,13 @@ function calibrateMainReadCounter(): void {
     accessToken: "physical-main-token",
     chatgptAccountId: "physical-main-account",
   });
-  expect(authJsonReads).toBeGreaterThan(0);
+  expect(nativeMainMemoryReads).toBeGreaterThan(0);
   resetMainReadObservations();
 }
 
 function resetMainReadObservations(): void {
-  authJsonReads = 0;
-  authJsonReadStacks = [];
+  nativeMainMemoryReads = 0;
+  nativeMainMemoryReadStacks = [];
 }
 
 /**
@@ -158,7 +159,7 @@ function resetMainReadObservations(): void {
  * say which fence failed. Every stack is kept for diagnostics either way.
  */
 function denialCacheMainReadStacks(): string[] {
-  return authJsonReadStacks.filter(stack =>
+  return nativeMainMemoryReadStacks.filter(stack =>
     stack.replaceAll("\\", "/").includes("/src/codex/model-entitlements.ts"));
 }
 
@@ -246,16 +247,15 @@ beforeEach(() => {
   resetAgentTaskRecoveryState();
   installCredentials();
 
-  const originalReadFileSync = fs.readFileSync as (...args: unknown[]) => unknown;
-  readSpy = spyOn(fs, "readFileSync");
-  readSpy.mockImplementation(((...args: unknown[]) => {
-    const target = args[0];
-    if (typeof target === "string" && target.endsWith("auth.json")) {
-      authJsonReads += 1;
-      authJsonReadStacks.push(new Error("auth.json read").stack ?? "stack unavailable");
+  const originalGetNativeMainAuthMemory = nativeMainCredentials.getNativeMainAuthMemory;
+  nativeMainReadSpy = spyOn(nativeMainCredentials, "getNativeMainAuthMemory");
+  nativeMainReadSpy.mockImplementation(((...args: Parameters<typeof originalGetNativeMainAuthMemory>) => {
+    if (typeof args[0] === "string" && args[0].endsWith("auth.json")) {
+      nativeMainMemoryReads += 1;
+      nativeMainMemoryReadStacks.push(new Error("native-main memory read").stack ?? "stack unavailable");
     }
-    return originalReadFileSync(...args);
-  }) as unknown as typeof fs.readFileSync);
+    return originalGetNativeMainAuthMemory(...args);
+  }) as typeof originalGetNativeMainAuthMemory);
   resetMainReadObservations();
   blockedHomeId = null;
 });
@@ -263,8 +263,8 @@ beforeEach(() => {
 afterEach(() => {
   globalThis.fetch = originalFetch;
   Date.now = originalNow;
-  readSpy?.mockRestore();
-  readSpy = undefined;
+  nativeMainReadSpy?.mockRestore();
+  nativeMainReadSpy = undefined;
   if (blockedHomeId !== null) completeNativeMainRecovery(blockedHomeId);
   blockedHomeId = null;
   clearAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
@@ -302,7 +302,7 @@ describe("preview and final authentication agree on the native-main read fence",
       primeCodexPoolQuotas: async () => {},
     });
     expect(owned).toMatchObject({ kind: "pool", accountId: "pool-a" });
-    expect(authJsonReads).toBe(0);
+    expect(nativeMainMemoryReads).toBe(0);
 
     // The option is only a claim by the caller. Without the bearer final auth must reject that
     // claim, leave the ownership fence open, and perform the ordinary physical-main reads.
@@ -311,7 +311,7 @@ describe("preview and final authentication agree on the native-main read fence",
       modelId: PREFERRED_MODEL,
       primeCodexPoolQuotas: async () => {},
     });
-    expect(authJsonReads).toBeGreaterThan(0);
+    expect(nativeMainMemoryReads).toBeGreaterThan(0);
   });
 
   test("the initial preview excludes physical main from denial-cache credential validation", async () => {
@@ -336,7 +336,7 @@ describe("preview and final authentication agree on the native-main read fence",
   /**
    * #4850. Pool eligibility was the last part of request preview outside the fence: with no
    * `isMainAccountTokenLive` in the preview options, `codexAccountUnusableReason` fell through to
-   * `isMainAccountCredentialUsable()` and opened the physical file, twice per spawn because
+   * `isMainAccountCredentialUsable()` and read the native-main memory store twice per spawn because
    * subagent fallback re-enters the preview through its callback.
    *
    * Asserted on the unfiltered counter on purpose. "The right credential was eventually sent"
@@ -361,8 +361,8 @@ describe("preview and final authentication agree on the native-main read fence",
 
     expect(response.status).toBe(200);
     expect(upstreamAuth).toEqual([`Bearer ${POOL_ACCESS_TOKEN}`]);
-    expect(authJsonReadStacks).toEqual([]);
-    expect(authJsonReads).toBe(0);
+    expect(nativeMainMemoryReadStacks).toEqual([]);
+    expect(nativeMainMemoryReads).toBe(0);
   });
 
   test("the initial preview also fences main for recovery blocking and selector drain", async () => {
@@ -375,7 +375,7 @@ describe("preview and final authentication agree on the native-main read fence",
     expect(blockNativeMainRecovery(blockedHomeId)).toBe(true);
     const blockedResponse = await postSpawn(providerConfig(), {}, new Headers());
     expect(blockedResponse.status).toBe(200);
-    expect(authJsonReads).toBe(0);
+    expect(nativeMainMemoryReads).toBe(0);
     expect(completeNativeMainRecovery(blockedHomeId)).toBe(true);
     blockedHomeId = null;
 
@@ -394,7 +394,7 @@ describe("preview and final authentication agree on the native-main read fence",
     resetMainReadObservations();
     await postSpawn(providerConfig(), { turnAdmissionLease }, new Headers());
     expect(selectionStarts).toBeGreaterThan(0);
-    expect(authJsonReads).toBe(0);
+    expect(nativeMainMemoryReads).toBe(0);
   });
 
   /**
@@ -414,6 +414,7 @@ describe("preview and final authentication agree on the native-main read fence",
           baseUrl: "https://chatgpt.com/backend-api/codex",
           authMode: "forward",
           codexAccountMode: "direct",
+          upstreamWebsocket: false,
         },
         backup: {
           adapter: "openai-responses",
@@ -468,7 +469,7 @@ describe("preview and final authentication agree on the native-main read fence",
     expect(recoveryCalls).toBe(1);
     expect(backupBodies).toHaveLength(1);
     expect(backupBodies[0]).toContain("Use the recovered assignment.");
-    expect(authJsonReads).toBe(0);
+    expect(nativeMainMemoryReads).toBe(0);
   });
 
   /**
@@ -572,7 +573,7 @@ describe("preview and final authentication agree on the native-main read fence",
     const response = await postSpawn(providerConfig(), {}, new Headers());
 
     expect(response.status).toBe(200);
-    expect(authJsonReads).toBeGreaterThan(0);
+    expect(nativeMainMemoryReads).toBeGreaterThan(0);
   });
 
   /**

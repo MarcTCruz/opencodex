@@ -58,6 +58,7 @@ function makeConfig(overrides: Partial<OcxConfig> = {}): OcxConfig {
         baseUrl: "https://chatgpt.com/backend-api/codex",
         authMode: "forward",
         codexAccountMode: "pool",
+        upstreamWebsocket: false,
       },
     },
     defaultProvider: "openai",
@@ -89,7 +90,7 @@ function whamResponse(weekly: number) {
 
 function seedMainAccount(accountId = "main-account", accessToken = "main-access"): void {
   writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-    tokens: { access_token: accessToken, account_id: accountId },
+    tokens: { access_token: accessToken, refresh_token: "main-refresh", account_id: accountId },
   }));
 }
 
@@ -519,9 +520,9 @@ describe("primeCodexPoolQuotas", () => {
     };
     try {
       for (const providers of [
-        { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward" as const, codexAccountMode: "direct" as const } },
+        { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward" as const, codexAccountMode: "direct" as const, upstreamWebsocket: false,} },
         { "openai-apikey": { adapter: "openai-responses", baseUrl: "https://api.openai.com/v1", apiKey: "sk-test" } },
-        { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward" as const, codexAccountMode: "pool" as const, disabled: true } },
+        { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward" as const, codexAccountMode: "pool" as const, disabled: true, upstreamWebsocket: false,} },
       ]) {
         const cfg = makeConfig({ providers });
         seedPoolAccount(cfg, `disabled-${calls}-${Object.keys(providers)[0]}`);

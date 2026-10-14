@@ -21,6 +21,7 @@ import {
 } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { atomicWriteFileAsync } from "../config";
+import type { AtomicWriteAsyncHooks, AtomicWriteAsyncIO } from "../config/atomic-write";
 import { hardenSecretDirAsync, hardenSecretPathAsync } from "../lib/windows-secret-acl";
 import { applyConfirmedMainCodexAccountTransition } from "./account-lifecycle";
 import {
@@ -45,8 +46,8 @@ import {
   nativeProfileSelectorKey,
   OsNativeProfileKeyProvider,
   publicNativeProfile,
+  parseNativeEnvelopeBytes,
   readNativeEnvelope,
-  readNativeEnvelopeResult,
   readNativeProfileVault,
   probeNativeProfileRecoveryState,
   requireFileCredentialStore,
@@ -55,6 +56,7 @@ import {
   serializeNativeProfileJournal,
   serializeNativeProfileMetadata,
   validateNativeProfileLabel,
+  type NativeEnvelopeReadResult,
   type NativeEnvelopeSnapshot,
   type NativeProfileContext,
 } from "./native-profile-store";
@@ -74,6 +76,19 @@ import {
   type NativeStageProof,
   type NativeStageTerminalOutcome,
 } from "./native-profile-stage-store";
+import {
+  getNativeMainAuthMemory,
+  NativeMainAuthChangedError,
+  nativeMainAuthFence,
+  nativeMainAuthFenceMatches,
+  nativeMainAuthReceiptFence,
+  nativeMainAuthStrictNoFollowAllowed,
+  observeNativeMainAuthFile,
+  verifyNativeMainAuthWriteReceipt,
+  writeNativeMainAuthFileAsyncClaimed,
+  type NativeMainAuthWriteFence,
+  type NativeMainAuthWriteReceipt,
+} from "./native-main-credentials";
 
 const LOCK_WAIT_MS = 5_000;
 const LEGACY_STAGE_MAX_AGE_MS = 30 * 60_000;
@@ -84,13 +99,73 @@ interface PathIdentity {
   ino: bigint;
 }
 
-type AtomicWriter = (path: string, content: string) => Promise<void>;
+type AtomicWriter = (path: string, content: string, hooks?: AtomicWriteAsyncHooks) => Promise<void>;
+type NativeAuthWriter = (
+  path: string,
+  content: string,
+  expectedSnapshot: NativeMainAuthWriteFence,
+) => Promise<NativeMainAuthWriteReceipt>;
 type TransitionApplier = (fromAccountId: string, toAccountId: string) => void;
 type EnvelopeReader = (path: string) => NativeEnvelopeSnapshot;
 type VaultReader = () => NativeMainProfileVaultV1 | null;
-type EnvelopeResultReader = (path: string) => ReturnType<typeof readNativeEnvelopeResult>;
+type EnvelopeResultReader = (path: string) => NativeEnvelopeReadResult;
 type StableLockOpener = (path: string) => StableLockFile;
 type StableLockAsserter = (path: string, file: StableLockFile) => void;
+
+function readCurrentNativeEnvelopeResultFromMemory(path: string): NativeEnvelopeReadResult {
+  const observation = getNativeMainAuthMemory(path);
+  if (observation.status !== "ok" || !observation.snapshot) {
+    const status = observation.status === "missing" || observation.status === "invalid"
+      ? observation.status
+      : "unreadable";
+    observation.raw?.fill(0);
+    observation.snapshot?.raw.fill(0);
+    return { status };
+  }
+  if (!nativeMainAuthStrictNoFollowAllowed(observation)) {
+    observation.raw?.fill(0);
+    observation.snapshot.raw.fill(0);
+    return { status: "unreadable" };
+  }
+  const raw = observation.snapshot.raw;
+  observation.raw?.fill(0);
+  try {
+    const envelope = parseNativeEnvelopeBytes(raw);
+    envelope.nativeMainAuthFence = nativeMainAuthFence(observation.snapshot);
+    envelope.isSymlink = observation.snapshot.isSymlink;
+    return { status: "ok", envelope };
+  } catch {
+    raw.fill(0);
+    return { status: "invalid" };
+  }
+}
+
+function assertNativeMainAuthWritable(path: string): NativeMainAuthWriteFence {
+  const observation = observeNativeMainAuthFile(path);
+  const status = observation.fileStatus === "valid" ? "unreadable" : observation.fileStatus;
+  const unsafeProvenance = !nativeMainAuthStrictNoFollowAllowed(observation);
+  const fence = observation.snapshot ? nativeMainAuthFence(observation.snapshot) : null;
+  observation.raw?.fill(0);
+  observation.snapshot?.raw.fill(0);
+  if (observation.fileStatus !== "valid" || !observation.canWriteFile
+    || !observation.canRefreshOrWrite || unsafeProvenance || !fence) {
+    const code = status === "missing" ? "AUTH_MISSING"
+      : status === "invalid" ? "AUTH_INVALID"
+        : "AUTH_UNREADABLE";
+    throw new NativeProfileError(code, "The native Codex credential envelope is " + status + ".", 409);
+  }
+  return fence;
+}
+
+function readCurrentNativeEnvelopeFromMemory(path: string): NativeEnvelopeSnapshot {
+  const result = readCurrentNativeEnvelopeResultFromMemory(path);
+  if (result.status === "ok") return result.envelope;
+  const code = result.status === "missing" ? "AUTH_MISSING"
+    : result.status === "invalid" ? "AUTH_INVALID"
+      : "AUTH_UNREADABLE";
+  throw new NativeProfileError(code, "The native Codex credential envelope is " + result.status + ".", 409);
+}
+
 export type NativeProfileSwitchBoundary =
   | "journal-prepared"
   | "auth-replaced"
@@ -103,6 +178,7 @@ export interface NativeProfileManagerOptions {
   configDir?: string;
   keyProvider?: NativeProfileKeyProvider;
   atomicWrite?: AtomicWriter;
+  nativeAuthWriteIO?: AtomicWriteAsyncIO;
   hardenPath?: (path: string) => Promise<void>;
   processProbe?: () => Promise<NativeCodexProcessProbe>;
   applyTransition?: TransitionApplier;
@@ -197,6 +273,7 @@ export class NativeProfileManager {
   readonly context: NativeProfileContext;
   private readonly keyProvider: NativeProfileKeyProvider;
   private readonly atomicWrite: AtomicWriter;
+  private readonly writeNativeAuth: NativeAuthWriter;
   private readonly hardenPath: (path: string) => Promise<void>;
   private readonly processProbe: () => Promise<NativeCodexProcessProbe>;
   private readonly applyTransition: TransitionApplier;
@@ -219,7 +296,14 @@ export class NativeProfileManager {
   constructor(options: NativeProfileManagerOptions = {}) {
     this.context = resolveNativeProfileContext(options);
     this.keyProvider = options.keyProvider ?? new OsNativeProfileKeyProvider();
-    this.atomicWrite = options.atomicWrite ?? atomicWriteFileAsync;
+    this.atomicWrite = options.atomicWrite ?? ((path, content, hooks) =>
+      atomicWriteFileAsync(path, content, undefined, undefined, hooks));
+    this.writeNativeAuth = (path, content, expectedSnapshot) => writeNativeMainAuthFileAsyncClaimed(
+      path,
+      content,
+      { expectedSnapshot },
+      options.nativeAuthWriteIO,
+    );
     this.hardenPath = options.hardenPath ?? hardenNativeProfilePath;
     this.processProbe = options.processProbe ?? probeNativeCodexProcesses;
     this.applyTransition = options.applyTransition ?? ((from, to) => { applyConfirmedMainCodexAccountTransition(from, to); });
@@ -230,9 +314,9 @@ export class NativeProfileManager {
     this.onLockAcquired = options.onLockAcquired ?? (() => {});
     this.removeStageTree = options.removeStageTree ?? (path => rmSync(path, { recursive: true, force: false }));
     this.onSwitchBoundary = options.onSwitchBoundary ?? (() => {});
-    this.readEnvelope = options.readEnvelope ?? readNativeEnvelope;
+    this.readEnvelope = options.readEnvelope ?? (() => readCurrentNativeEnvelopeFromMemory(this.context.authPath));
     this.readVault = options.readVault ?? (() => readNativeProfileVault(this.context));
-    this.readEnvelopeResult = options.readEnvelopeResult ?? readNativeEnvelopeResult;
+    this.readEnvelopeResult = options.readEnvelopeResult ?? (() => readCurrentNativeEnvelopeResultFromMemory(this.context.authPath));
     this.stableLockOpen = options.stableLockOpen ?? openStableLockFile;
     this.stableLockAssert = options.stableLockAssert ?? assertStableLockFile;
     this.stageStore = new NativeProfileStageStore({
@@ -444,6 +528,7 @@ export class NativeProfileManager {
     try {
       const vault = this.readVault();
       if (!vault) return false;
+      assertNativeMainAuthWritable(this.context.authPath);
       key = await this.keyForVault(vault);
       current = this.readEnvelope(this.context.authPath);
       this.assertCurrentIdentity(vault, current, key);
@@ -712,15 +797,15 @@ export class NativeProfileManager {
 
   private deleteStage(path: string, identity?: PathIdentity): void {
     if (identity) assertPathIdentity(path, identity, "The native-login staging directory");
-    const authPath = join(path, "auth.json");
+    const stagedAuthPath = join(path, "auth.json");
     let authFd: number | undefined;
     try {
       const flags = process.platform === "win32"
         ? fsConstants.O_RDWR
         : fsConstants.O_RDWR | fsConstants.O_NOFOLLOW;
-      authFd = openSync(authPath, flags);
+      authFd = openSync(stagedAuthPath, flags);
       const opened = fstatSync(authFd, { bigint: true });
-      const pathEntry = lstatSync(authPath, { bigint: true });
+      const pathEntry = lstatSync(stagedAuthPath, { bigint: true });
       if (
         !opened.isFile()
         || !pathEntry.isFile()
@@ -736,7 +821,7 @@ export class NativeProfileManager {
         true,
         true,
       );
-      unlinkSync(authPath);
+      unlinkSync(stagedAuthPath);
       const unlinked = fstatSync(authFd, { bigint: true });
       if (unlinked.dev !== opened.dev || unlinked.ino !== opened.ino || unlinked.nlink !== 0n) {
         throw new NativeProfileError(
@@ -1086,7 +1171,7 @@ export class NativeProfileManager {
         const label = validateNativeProfileLabel(labelInput);
         target = readNativeEnvelope(join(ownedStage.path, "auth.json"));
         assertPathIdentity(ownedStage.path, ownedStage.identity, "The native-login staging directory");
-        current = readNativeEnvelope(this.context.authPath);
+        current = this.readEnvelope(this.context.authPath);
         const vault = this.requireVault();
         if (vault.profiles.length >= MAX_NATIVE_PROFILES) {
           throw new NativeProfileError("INVALID_REQUEST", "Native profiles are limited to 32 entries.", 400);
@@ -1248,6 +1333,22 @@ export class NativeProfileManager {
     }
   }
 
+  private assertNativeAuthReceiptCurrent(receipt: NativeMainAuthWriteReceipt): void {
+    if (!verifyNativeMainAuthWriteReceipt(receipt)) throw new NativeMainAuthChangedError();
+  }
+
+  private assertNativeAuthFenceCurrent(fence: NativeMainAuthWriteFence): void {
+    const observation = observeNativeMainAuthFile(this.context.authPath);
+    const matches = observation.fileStatus === "valid"
+      && observation.canWriteFile
+      && observation.leafProvenance === "regular"
+      && observation.snapshot?.leafProvenance === "regular"
+      && nativeMainAuthFenceMatches(observation.snapshot, fence);
+    observation.raw?.fill(0);
+    observation.snapshot?.raw.fill(0);
+    if (!matches) throw new NativeMainAuthChangedError();
+  }
+
   async switch(targetSelector: string, confirmedStopped = false): Promise<Record<string, unknown>> {
     return this.withLock(async () => {
       await this.sweepStagesLocked();
@@ -1260,9 +1361,21 @@ export class NativeProfileManager {
       let target: NativeEnvelopeSnapshot | null = null;
       let journalPrepared = false;
       let committed = false;
+      let sourceFence: NativeMainAuthWriteFence | null = null;
+      let targetReceipt: NativeMainAuthWriteReceipt | null = null;
       try {
+        sourceFence = assertNativeMainAuthWritable(this.context.authPath);
         key = await this.keyForVault(beforeVault);
+        const sourceObservation = observeNativeMainAuthFile(this.context.authPath);
+        const sourceStillMatches = sourceObservation.canWriteFile
+          && sourceObservation.leafProvenance === "regular"
+          && sourceObservation.snapshot?.leafProvenance === "regular"
+          && nativeMainAuthFenceMatches(sourceObservation.snapshot, sourceFence);
+        sourceObservation.raw?.fill(0);
+        sourceObservation.snapshot?.raw.fill(0);
+        if (!sourceStillMatches) throw new NativeMainAuthChangedError();
         source = this.readEnvelope(this.context.authPath);
+        if (source.digest !== sourceFence.digest) throw new NativeMainAuthChangedError();
         const sourceProfile = this.assertCurrentIdentity(beforeVault, source, key);
         const targetProfile = this.resolveTarget(beforeVault, targetSelector);
         target = decryptNativeEnvelope(this.context, targetProfile.id, targetProfile.identityHash, targetProfile.payload!, key);
@@ -1305,20 +1418,29 @@ export class NativeProfileManager {
         journalPrepared = true;
         await this.onSwitchBoundary("journal-prepared");
         this.assertOperationStorageStable();
-        await this.atomicWrite(this.context.authPath, target.text);
+        targetReceipt = await this.writeNativeAuth(this.context.authPath, target.text, sourceFence);
+        this.assertNativeAuthReceiptCurrent(targetReceipt);
         const observedTarget = this.verifyWrittenEnvelope(target.digest, targetProfile.identityHash, key);
         observedTarget.raw.fill(0);
+        this.assertNativeAuthReceiptCurrent(targetReceipt);
         advanceCodexCredentialMutationEpoch();
         await this.onSwitchBoundary("auth-replaced");
+        this.assertNativeAuthReceiptCurrent(targetReceipt);
         journal.phase = "auth-replaced";
         await this.writeJournal(journal);
+        this.assertNativeAuthReceiptCurrent(targetReceipt);
         await this.writeVault(afterVault);
         committed = true;
+        this.assertNativeAuthReceiptCurrent(targetReceipt);
         await this.onSwitchBoundary("vault-committed");
+        this.assertNativeAuthReceiptCurrent(targetReceipt);
         journal.phase = "vault-committed";
         await this.writeJournal(journal);
+        this.assertNativeAuthReceiptCurrent(targetReceipt);
         this.applyTransition(source.accountId, target.accountId);
+        this.assertNativeAuthReceiptCurrent(targetReceipt);
         await this.onSwitchBoundary("runtime-transition-published");
+        this.assertNativeAuthReceiptCurrent(targetReceipt);
         this.removeJournal();
         await this.onSwitchBoundary("journal-deleted");
         return {
@@ -1332,15 +1454,44 @@ export class NativeProfileManager {
         if (committed) {
           throw new NativeProfileError("RECOVERY_REQUIRED", "The login changed, but final transaction cleanup requires recovery.", 409);
         }
+        if (!targetReceipt) {
+          try {
+            if (!sourceFence) throw new NativeMainAuthChangedError();
+            this.assertNativeAuthFenceCurrent(sourceFence);
+            this.removeJournal();
+          } catch {
+            throw new NativeProfileError(
+              "RECOVERY_REQUIRED",
+              "The current auth.json changed before publication; the encrypted recovery journal was retained.",
+              409,
+            );
+          }
+          throw new NativeProfileError("SWITCH_ROLLED_BACK", "The native-login switch failed before publication; the original login remains current.", 409);
+        }
         try {
           this.assertOperationStorageStable();
-          await this.atomicWrite(this.context.authPath, source!.text);
+          this.assertNativeAuthReceiptCurrent(targetReceipt);
+          const rollbackReceipt = await this.writeNativeAuth(
+            this.context.authPath,
+            source!.text,
+            nativeMainAuthReceiptFence(targetReceipt),
+          );
+          this.assertNativeAuthReceiptCurrent(rollbackReceipt);
           const restored = this.verifyWrittenEnvelope(source!.digest, nativeIdentityHash(key!.key, source!.accountId), key!);
           restored.raw.fill(0);
+          this.assertNativeAuthReceiptCurrent(rollbackReceipt);
           advanceCodexCredentialMutationEpoch();
           await this.writeVault(beforeVault);
+          this.assertNativeAuthReceiptCurrent(rollbackReceipt);
           this.removeJournal();
-        } catch {
+        } catch (rollbackError) {
+          if (rollbackError instanceof NativeMainAuthChangedError) {
+            throw new NativeProfileError(
+              "RECOVERY_REQUIRED",
+              "The current auth.json is invalid or changed; the encrypted recovery journal was retained until a valid state is observed.",
+              409,
+            );
+          }
           throw new NativeProfileError(
             "AUTH_RESTORE_FAILED",
             "The original native login could not be verified after rollback; the encrypted recovery journal was retained.",
@@ -1382,18 +1533,44 @@ export class NativeProfileManager {
       };
     }
     let key: NativeProfileKey | null = null;
-    let current: ReturnType<typeof readNativeEnvelopeResult> | null = null;
+    let current: NativeEnvelopeReadResult | null = null;
     let sourceEnvelope: NativeEnvelopeSnapshot | null = null;
     try {
+      const initialObservation = observeNativeMainAuthFile(this.context.authPath);
+      const initialFence = initialObservation.fileStatus === "valid"
+        && initialObservation.canWriteFile
+        && initialObservation.leafProvenance === "regular"
+        && initialObservation.snapshot?.leafProvenance === "regular"
+        && initialObservation.snapshot
+        ? nativeMainAuthFence(initialObservation.snapshot)
+        : null;
+      initialObservation.raw?.fill(0);
+      initialObservation.snapshot?.raw.fill(0);
       key = await this.keyForVault(journal.beforeVault);
-      current = readNativeEnvelopeResult(this.context.authPath);
-      if (current.status !== "ok") {
+      if (!initialFence) {
+        throw new NativeProfileError("RECOVERY_REQUIRED", "Recovery stopped because auth.json is not a valid physical file; the encrypted journal remains available for retry.", 409);
+      }
+      const fileObservation = observeNativeMainAuthFile(this.context.authPath);
+      const canRecover = fileObservation.fileStatus === "valid"
+        && fileObservation.canWriteFile
+        && fileObservation.leafProvenance === "regular"
+        && fileObservation.snapshot?.leafProvenance === "regular"
+        && nativeMainAuthFenceMatches(fileObservation.snapshot, initialFence);
+      fileObservation.raw?.fill(0);
+      fileObservation.snapshot?.raw.fill(0);
+      current = this.readEnvelopeResult(this.context.authPath);
+      if (!canRecover || current.status !== "ok") {
         throw new NativeProfileError("RECOVERY_REQUIRED", "Recovery stopped because the current native login is not readable and confirmed.", 409);
+      }
+      if (current.envelope.digest !== initialFence.digest) {
+        throw new NativeProfileError("RECOVERY_REQUIRED", "Recovery stopped because auth.json changed after recovery began; the encrypted journal remains available for retry.", 409);
       }
       const currentHash = nativeIdentityHash(key.key, current.envelope.accountId);
       if (rollback) {
         if (currentHash === journal.sourceIdentityHash) {
+          this.assertNativeAuthFenceCurrent(initialFence!);
           await this.writeVault(journal.beforeVault);
+          this.assertNativeAuthFenceCurrent(initialFence!);
           this.removeJournal();
           return {
             ok: true,
@@ -1444,17 +1621,35 @@ export class NativeProfileManager {
           const preservedJournal = structuredClone(journal);
           preservedJournal.targetPayload = refreshedTargetPayload;
           preservedJournal.beforeVault = structuredClone(rollbackVault);
+          this.assertNativeAuthFenceCurrent(initialFence!);
           await this.writeJournal(preservedJournal);
+          this.assertNativeAuthFenceCurrent(initialFence!);
           await this.writeVault(rollbackVault);
+          this.assertNativeAuthFenceCurrent(initialFence!);
           rollbackVaultPublished = true;
         }
         this.assertOperationStorageStable();
-        await this.atomicWrite(this.context.authPath, sourceEnvelope.text);
+        this.assertNativeAuthFenceCurrent(initialFence!);
+        let rollbackReceipt: NativeMainAuthWriteReceipt;
+        try {
+          rollbackReceipt = await this.writeNativeAuth(this.context.authPath, sourceEnvelope.text, initialFence!);
+        } catch (error) {
+          if (error instanceof NativeMainAuthChangedError) {
+            throw new NativeProfileError("RECOVERY_REQUIRED", "Recovery stopped because auth.json changed or became invalid; the encrypted journal remains available for retry.", 409);
+          }
+          throw error;
+        }
+        this.assertNativeAuthReceiptCurrent(rollbackReceipt);
         const restored = this.verifyWrittenEnvelope(sourceEnvelope.digest, journal.sourceIdentityHash, key);
         restored.raw.fill(0);
+        this.assertNativeAuthReceiptCurrent(rollbackReceipt);
         advanceCodexCredentialMutationEpoch();
-        if (!rollbackVaultPublished) await this.writeVault(rollbackVault);
+        if (!rollbackVaultPublished) {
+          await this.writeVault(rollbackVault);
+          this.assertNativeAuthReceiptCurrent(rollbackReceipt);
+        }
         this.applyTransition(current.envelope.accountId, sourceEnvelope.accountId);
+        this.assertNativeAuthReceiptCurrent(rollbackReceipt);
         this.removeJournal();
         return {
           ok: true,
@@ -1475,7 +1670,9 @@ export class NativeProfileManager {
         throw new NativeProfileError("RECOVERY_REQUIRED", "Recovery found a third or unknown native identity and made no credential write.", 409);
       }
       if (decision.action === "rollback-source") {
+        this.assertNativeAuthFenceCurrent(initialFence!);
         await this.writeVault(journal.beforeVault);
+        this.assertNativeAuthFenceCurrent(initialFence!);
         this.removeJournal();
         return {
           ok: true,
@@ -1493,8 +1690,11 @@ export class NativeProfileManager {
         journal.sourcePayload,
         key,
       );
+      this.assertNativeAuthFenceCurrent(initialFence!);
       await this.writeVault(journal.afterVault);
+      this.assertNativeAuthFenceCurrent(initialFence!);
       this.applyTransition(sourceEnvelope.accountId, current.envelope.accountId);
+      this.assertNativeAuthFenceCurrent(initialFence!);
       this.removeJournal();
       return {
         ok: true,

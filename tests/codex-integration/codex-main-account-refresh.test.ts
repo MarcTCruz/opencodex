@@ -3,11 +3,17 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, writeFi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  getMainAccountToken,
   getValidMainAccountToken,
   isMainAccountRefreshGrantRejected,
   setMainAuthJsonBeforeRenameHookForTests,
 } from "../../src/codex/main-account";
 import { codexCredentialMutationEpoch } from "../../src/codex/credential-mutation-epoch";
+import {
+  getNativeMainAuthMemory,
+  observeNativeMainAuthFile,
+  stopNativeMainCredentialWatchers,
+} from "../../src/codex/native-main-credentials";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 
 let home: string;
@@ -15,6 +21,11 @@ let previousCodexHome: string | undefined;
 
 function expiredJwt(): string {
   const payload = Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) - 60 })).toString("base64url");
+  return `header.${payload}.signature`;
+}
+
+function jwtWithExp(expSeconds: number): string {
+  const payload = Buffer.from(JSON.stringify({ exp: expSeconds })).toString("base64url");
   return `header.${payload}.signature`;
 }
 
@@ -26,17 +37,19 @@ beforeEach(() => {
 
 afterEach(() => {
   setMainAuthJsonBeforeRenameHookForTests(null);
+  stopNativeMainCredentialWatchers();
   if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
   else process.env.CODEX_HOME = previousCodexHome;
   removeTreeWithRetry(home);
 });
 
 describe("native main token refresh", () => {
-  test("refreshes a refresh-only auth file and atomically preserves unrelated fields", async () => {
+  test("refreshes a complete ChatGPT auth file and atomically preserves unrelated fields", async () => {
     const authPath = join(home, "auth.json");
     const original = {
       auth_mode: "chatgpt",
       tokens: {
+        access_token: expiredJwt(),
         refresh_token: "old-refresh",
         account_id: "account-main",
         future_token_field: "preserve-token",
@@ -110,7 +123,7 @@ describe("native main token refresh", () => {
     expect(token).toEqual({ accessToken: "new-access", chatgptAccountId: "account-main" });
     expect(readFileSync(authPath, "utf8")).toBe(external);
     expect(readdirSync(home).filter(name => name.includes(".tmp"))).toEqual([]);
-    expect(codexCredentialMutationEpoch()).toBe(epochBefore);
+    expect(codexCredentialMutationEpoch()).toBe(epochBefore + 1);
     expect(isMainAccountRefreshGrantRejected()).toBe(false);
   });
 
@@ -254,7 +267,7 @@ describe("native main token refresh", () => {
   });
 });
 
-describe("publication never overwrites an external Codex writer (#2999)", () => {
+describe("publication adopts newer external Codex credentials (#2999)", () => {
   const refreshOk = async () => ({
     access: "ocx-staged-access",
     refresh: "ocx-staged-refresh",
@@ -289,10 +302,7 @@ describe("publication never overwrites an external Codex writer (#2999)", () => 
     expect(readFileSync(authPath, "utf8")).not.toContain("ocx-staged-access");
   });
 
-  test("a same-bytes replacement with a new inode is still refused", async () => {
-    // The case a content hash cannot see. rename(2) replaces unconditionally, so the
-    // question that matters at the boundary is "is this the same FILE", not "does it hash
-    // the same" - an external writer that rewrote identical bytes still owns the target.
+  test("a same-bytes replacement with a new inode still refuses publication", async () => {
     const authPath = join(home, "auth.json");
     seedExpired(authPath);
     const identical = readFileSync(authPath, "utf8");
@@ -310,25 +320,32 @@ describe("publication never overwrites an external Codex writer (#2999)", () => 
     expect(readFileSync(authPath, "utf8")).not.toContain("ocx-staged-access");
   });
 
-  test("the canonical target survives a refused publication", async () => {
-    // A refusal must never leave the credential missing: losing auth.json is worse than
-    // losing the refresh, because Codex CLI then has nothing to authenticate with.
+  test("an access-token-only Codex write is a hiccup while the rotated grant stays in memory", async () => {
     const authPath = join(home, "auth.json");
     seedExpired(authPath);
+    const external = JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "other" } });
     setMainAuthJsonBeforeRenameHookForTests(() => {
-      writeFileSync(authPath, JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "other" } }));
+      writeFileSync(authPath, external);
     });
 
-    await getValidMainAccountToken({ refreshToken: refreshOk });
+    const token = await getValidMainAccountToken({ refreshToken: refreshOk });
+    const memory = getNativeMainAuthMemory(authPath);
+    const memoryRaw = memory.snapshot?.raw.toString("utf8");
+    memory.snapshot?.raw.fill(0);
+    memory.raw?.fill(0);
 
+    expect(token?.accessToken).toBe("ocx-staged-access");
+    expect(memoryRaw).toContain("ocx-staged-refresh");
+    expect(memory).toMatchObject({ fileStatus: "invalid", canRefreshOrWrite: false });
     expect(existsSync(authPath)).toBe(true);
+    expect(readFileSync(authPath, "utf8")).toBe(external);
     expect(readdirSync(home).filter(name => name.startsWith("auth.json.")).length).toBe(0);
   });
 
   test("a torn in-place rewrite is left alone and the next read sees the writer's file", async () => {
     // Codex rewrites auth.json in place (truncate, then write). A refresh that lands while the
-    // file is empty must not publish over it, must not mark the old grant rejected, and must
-    // not keep the rotated grant anywhere: the next read follows whatever Codex finished.
+    // file is empty must not publish over it; memory keeps the rotated grant during the hiccup
+    // and adopts Codex's finished file when the watcher observes it.
     const authPath = join(home, "auth.json");
     seedExpired(authPath);
     const epochBefore = codexCredentialMutationEpoch();
@@ -338,7 +355,7 @@ describe("publication never overwrites an external Codex writer (#2999)", () => 
 
     expect(token).toEqual({ accessToken: "ocx-staged-access", chatgptAccountId: "account-main" });
     expect(readFileSync(authPath, "utf8")).toBe("");
-    expect(codexCredentialMutationEpoch()).toBe(epochBefore);
+    expect(codexCredentialMutationEpoch()).toBe(epochBefore + 1);
     expect(readdirSync(home).filter(name => name.includes(".tmp"))).toEqual([]);
 
     const codexFinished = JSON.stringify({
@@ -346,6 +363,7 @@ describe("publication never overwrites an external Codex writer (#2999)", () => 
       tokens: { access_token: "codex-finished-access", refresh_token: "codex-refresh", account_id: "account-main" },
     });
     writeFileSync(authPath, codexFinished);
+    observeNativeMainAuthFile(authPath);
     expect(isMainAccountRefreshGrantRejected()).toBe(false);
     const next = await getValidMainAccountToken({
       refreshToken: async () => { throw new Error("must not refresh a fresh Codex token"); },
@@ -415,7 +433,7 @@ describe("publication never overwrites an external Codex writer (#2999)", () => 
     expect(codexCredentialMutationEpoch()).toBe(epochBefore + 1);
   });
 
-  test("an external writer during a cancelled exchange still refuses publication", async () => {
+  test("an external login during a cancelled exchange stays adopted before cancellation surfaces", async () => {
     const authPath = join(home, "auth.json");
     seedExpired(authPath);
     const external = JSON.stringify({
@@ -437,7 +455,8 @@ describe("publication never overwrites an external Codex writer (#2999)", () => 
     })).rejects.toBe(abortReason);
 
     expect(readFileSync(authPath, "utf8")).toBe(external);
+    expect(getMainAccountToken()?.accessToken).toBe("external-access");
     expect(readdirSync(home).filter(name => name.includes(".tmp"))).toEqual([]);
-    expect(codexCredentialMutationEpoch()).toBe(epochBefore);
+    expect(codexCredentialMutationEpoch()).toBe(epochBefore + 1);
   });
 });

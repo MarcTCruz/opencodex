@@ -12,7 +12,7 @@ function fixture() {
   const path = join(root, "auth.json"); let revision = 0;
   const write = (id = "fixture-A", access = "synthetic-access-A") => {
     const claims = { "https://api.openai.com/auth": { chatgpt_account_id: id, chatgpt_user_id: "fixture-user", chatgpt_plan_type: "pro" } };
-    writeFileSync(path, JSON.stringify({ auth_mode: "chatgpt", tokens: { account_id: id, access_token: access,
+    writeFileSync(path, JSON.stringify({ auth_mode: "chatgpt", tokens: { account_id: id, access_token: access, refresh_token: "synthetic-refresh",
       id_token: `fixture.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.fixture` } }));
     const timestamp = new Date(Date.now() + ++revision * 2000); utimesSync(path, timestamp, timestamp);
   };

@@ -357,7 +357,7 @@ describe("Codex catalog restore", () => {
     const catalogPath = join(codexHome, "catalog.json");
     writeFileSync(join(codexHome, "config.toml"), 'model_catalog_json = "catalog.json"\n', "utf8");
     writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
-      tokens: { access_token: "catalog-main-access", account_id: "catalog-main-account" },
+      tokens: { access_token: "catalog-main-access", refresh_token: "catalog-main-refresh", account_id: "catalog-main-account" },
     }), "utf8");
     writeFileSync(catalogPath, JSON.stringify({
       models: [

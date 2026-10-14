@@ -38,7 +38,7 @@ import {
   resolveGuiFilePath,
   rootFallbackPayload,
   safeConfigDTO,
-  startServer,
+  startServer as startServerCore,
 } from "../../src/server";
 import { clearRequestLogsForTests, getRequestLogEntries } from "../../src/server/request-log";
 import { setRelayPlatformForTests } from "../../src/server/responses/passthrough-delivery";
@@ -46,6 +46,7 @@ import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
 import { readUsageEntries } from "../../src/usage/log";
 import { handleManagementAPI } from "../../src/server/management-api";
 import { handleResponses, handleResponsesCompact } from "../../src/server/responses";
+import { clearResponseStateForTests } from "../../src/responses/state";
 import type { OcxConfig } from "../../src/types";
 import { fakeChatGptJwt } from "../helpers/fake-chatgpt-jwt";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "../helpers/isolated-codex-home";
@@ -79,6 +80,46 @@ const originalGlobalWebSocket = globalThis.WebSocket;
 const TEST_DIR = mkdtempSync(join(tmpdir(), "ocx-server-auth-"));
 let isolatedCodexHome: IsolatedCodexHome | null = null;
 let managementFixture: ManagementServerFixture | null = null;
+type CaseServer = ReturnType<typeof startServerCore> | ReturnType<typeof Bun.serve>;
+const caseServerCleanups: Array<() => Promise<void>> = [];
+const caseServerStops = new WeakMap<CaseServer, Promise<void>>();
+
+function trackCaseServer<T extends CaseServer>(server: T): T {
+  caseServerCleanups.push(() => stopCaseServer(server));
+  return server;
+}
+
+function trackCaseServerCleanup(cleanup: () => Promise<void>): void {
+  caseServerCleanups.push(cleanup);
+}
+
+function stopCaseServer(server: CaseServer): Promise<void> {
+  const existing = caseServerStops.get(server);
+  if (existing) return existing;
+  const stopping = Promise.resolve().then(() => server.stop(true));
+  caseServerStops.set(server, stopping);
+  return stopping;
+}
+
+async function stopCaseServers(): Promise<void> {
+  let stopError: unknown;
+  for (const cleanup of caseServerCleanups.splice(0).reverse()) {
+    try {
+      await cleanup();
+    } catch (error) {
+      stopError ??= error;
+    }
+  }
+  if (stopError) throw stopError;
+}
+
+function startServer(...args: Parameters<typeof startServerCore>): ReturnType<typeof startServerCore> {
+  return trackCaseServer(startServerCore(...args));
+}
+
+function startUpstream(options: Parameters<typeof Bun.serve>[0]): ReturnType<typeof Bun.serve> {
+  return trackCaseServer(Bun.serve(options));
+}
 
 const REMOTE_CATALOG_BYTES = '{"models":[{"slug":"fixture/model","display_name":"Fixture Model","priority":1,"visibility":"list","base_instructions":"Fixture instructions","input_modalities":["text"]}]}';
 const REMOTE_DATA_KEY = "ocx_data_remote_catalog";
@@ -101,6 +142,7 @@ const canonicalDirect = {
   baseUrl: "https://chatgpt.com/backend-api/codex",
   authMode: "forward",
   codexAccountMode: "direct",
+  upstreamWebsocket: false,
 } as const;
 
 function poolProviders(): OcxConfig["providers"] {
@@ -126,10 +168,21 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  let cleanupError: unknown;
   if (managementFixture) {
-    await managementFixture.close();
+    try {
+      await managementFixture.close();
+    } catch (error) {
+      cleanupError ??= error;
+    }
     managementFixture = null;
   }
+  try {
+    await stopCaseServers();
+  } catch (error) {
+    cleanupError ??= error;
+  }
+  clearResponseStateForTests();
   globalThis.fetch = originalGlobalFetch;
   globalThis.WebSocket = originalGlobalWebSocket;
   if (previousApiToken === undefined) delete process.env.OPENCODEX_API_AUTH_TOKEN;
@@ -139,13 +192,34 @@ afterEach(async () => {
   else process.env.OPENCODEX_HOME = previousOpencodexHome;
   isolatedCodexHome?.restore();
   isolatedCodexHome = null;
+  expect(spendLedgerOwnerSnapshot().ownership).toBe("unheld");
   if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
   if (existsSync(POOL_RETRY_TEST_DIR)) removeTreeWithRetry(POOL_RETRY_TEST_DIR);
+  if (cleanupError) throw cleanupError;
 });
 
-const { startPoolRetryHarness, stopPoolRetryHarness, rejectionResponse, expectOriginal400, unsupportedModelBody } =
+const {
+  startPoolRetryHarness: startPoolRetryHarnessCore,
+  rejectionResponse,
+  expectOriginal400,
+  unsupportedModelBody,
+} =
   createPoolRetryHarness({ testDir: POOL_RETRY_TEST_DIR, originalFetch: originalGlobalFetch,
-    redirectCanonicalCodexTo, canonicalDirect });
+    redirectCanonicalCodexTo, trackServer: server => trackCaseServer(server), canonicalDirect });
+type PoolRetryHarness = Awaited<ReturnType<typeof startPoolRetryHarnessCore>>;
+
+function startPoolRetryHarness(...args: Parameters<typeof startPoolRetryHarnessCore>): Promise<PoolRetryHarness> {
+  return startPoolRetryHarnessCore(...args);
+}
+
+function stopPoolRetryHarness(harness: PoolRetryHarness): Promise<void> {
+  return Promise.all([
+    stopCaseServer(harness.server),
+    stopCaseServer(harness.upstream),
+  ]).then(() => {
+    harness.restoreFetch();
+  });
+}
 
 describe("Responses request identity handoff", () => {
   test("returns the generated request id and overwrites an upstream value", async () => {
@@ -308,7 +382,7 @@ describe("Responses request identity handoff", () => {
       expect(getRequestLogEntries()).toHaveLength(0);
       expect(readUsageEntries()).toHaveLength(0);
     } finally {
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   }, { timeout: SERVER_BUDGET_MS });
 });
@@ -482,7 +556,7 @@ describe("server local API auth", () => {
 
   test("responses handler accepts a combo body exactly once across failover children", async () => {
     const upstreamModels: string[] = [];
-    const upstream = Bun.serve({
+    const upstream = startUpstream({
       hostname: "127.0.0.1",
       port: 0,
       async fetch(request) {
@@ -531,7 +605,7 @@ describe("server local API auth", () => {
       expect(upstreamModels).toEqual(["first-model", "second-model"]);
       await response.text();
     } finally {
-      await upstream.stop(true);
+      await stopCaseServer(upstream);
       releaseSpendHome();
     }
   });
@@ -625,7 +699,7 @@ describe("server local API auth", () => {
       expect((rejected.headers.get("access-control-allow-headers") ?? "").toLowerCase())
         .not.toContain("x-stainless-lang");
     } finally {
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   });
 
@@ -825,6 +899,7 @@ describe("server local API auth", () => {
           adapter: "openai-responses",
           baseUrl: "https://chatgpt.com/backend-api/codex",
           authMode: "forward",
+          upstreamWebsocket: false,
         },
       },
     } as OcxConfig);
@@ -851,7 +926,7 @@ describe("server local API auth", () => {
       });
       expect(sameOrigin.status).toBe(200);
     } finally {
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   }, 15_000);
 
@@ -891,7 +966,7 @@ describe("server local API auth", () => {
       });
       expect(ok.status).toBe(200);
     } finally {
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   });
 
@@ -940,7 +1015,7 @@ describe("server local API auth", () => {
       expect(healthBody.guiPairCapability).toBe(GUI_PAIR_CAPABILITY_VERSION);
       expect("rss" in healthBody).toBe(false);
     } finally {
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   });
 
@@ -976,7 +1051,7 @@ describe("server local API auth", () => {
       expect(allowedHeaders).toContain("X-OpenCodex-CSRF-Token");
       expect(allowedHeaders).not.toContain("X-Unrelated-Custom-Header");
     } finally {
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   });
 
@@ -1062,7 +1137,7 @@ describe("server local API auth", () => {
         "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       );
     } finally {
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   });
 
@@ -1085,13 +1160,15 @@ describe("server local API auth", () => {
       expect(response.status).toBe(403);
       expect(await response.json()).toMatchObject({ error: "cross-origin request blocked" });
     } finally {
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   });
 
   describe("management CORS fixture", () => {
     beforeEach(async () => {
-      managementFixture = await startManagementServerFixture(TEST_DIR, config("127.0.0.1"));
+      const fixture = await startManagementServerFixture(TEST_DIR, config("127.0.0.1"));
+      managementFixture = fixture;
+      trackCaseServerCleanup(() => fixture.close());
     });
 
     test("management CORS echoes validated loopback Origin and covers delegated codex-auth responses", async () => {
@@ -1141,7 +1218,9 @@ describe("server local API auth", () => {
   describe("non-loopback management fixture", () => {
     beforeEach(async () => {
       process.env.OPENCODEX_API_AUTH_TOKEN = "local-secret";
-      managementFixture = await startManagementServerFixture(TEST_DIR, { ...config("0.0.0.0"), port: 0 });
+      const fixture = await startManagementServerFixture(TEST_DIR, { ...config("0.0.0.0"), port: 0 });
+      managementFixture = fixture;
+      trackCaseServerCleanup(() => fixture.close());
     });
 
     test("non-loopback management API allows same-origin GUI requests with API token", async () => {
@@ -1220,7 +1299,7 @@ describe("server local API auth", () => {
         error: { code: "origin_rejected" },
       });
     } finally {
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   });
 
@@ -1247,7 +1326,7 @@ describe("server local API auth", () => {
         error: { type: "upgrade_required" },
       });
     } finally {
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   });
 
@@ -1257,7 +1336,7 @@ describe("server local API auth", () => {
     process.env.OPENCODEX_HOME = TEST_DIR;
     delete process.env.OPENCODEX_API_AUTH_TOKEN;
 
-    const upstream = Bun.serve({
+    const upstream = startUpstream({
       port: 0,
       fetch() {
         return Response.json({
@@ -1291,8 +1370,8 @@ describe("server local API auth", () => {
       const json = await post.json() as { output?: { type: string; content?: { text?: string }[] }[] };
       expect(json.output?.find(o => o.type === "message")?.content?.[0]?.text).toBe("http fallback ok");
     } finally {
-      await server.stop(true);
-      upstream.stop(true);
+      await stopCaseServer(server);
+      await stopCaseServer(upstream);
     }
   });
 
@@ -1302,7 +1381,7 @@ describe("server local API auth", () => {
     process.env.OPENCODEX_HOME = TEST_DIR;
     delete process.env.OPENCODEX_API_AUTH_TOKEN;
 
-    const upstream = Bun.serve({
+    const upstream = startUpstream({
       port: 0,
       fetch() {
         return new Response(JSON.stringify({ error: { message: "summarizer exploded" } }), {
@@ -1331,8 +1410,8 @@ describe("server local API auth", () => {
       const body = await response.json() as { error?: { message?: string } };
       expect(body.error?.message ?? "").toContain("500");
     } finally {
-      await server.stop(true);
-      upstream.stop(true);
+      await stopCaseServer(server);
+      await stopCaseServer(upstream);
     }
   });
 
@@ -1354,7 +1433,7 @@ describe("server local API auth", () => {
         expect(response.headers.get("content-type")).toContain("application/json");
       }
     } finally {
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   });
 
@@ -1364,7 +1443,7 @@ describe("server local API auth", () => {
     process.env.OPENCODEX_HOME = TEST_DIR;
     delete process.env.OPENCODEX_API_AUTH_TOKEN;
 
-    const upstream = Bun.serve({
+    const upstream = startUpstream({
       port: 0,
       fetch() {
         // Anthropic non-stream response carrying the summarizer's text.
@@ -1414,8 +1493,8 @@ describe("server local API auth", () => {
       // No ocx1 envelope may leak into v1 output.
       expect(JSON.stringify(json)).not.toContain("ocx1:");
     } finally {
-      await server.stop(true);
-      await upstream.stop(true);
+      await stopCaseServer(server);
+      await stopCaseServer(upstream);
     }
   });
 
@@ -1438,7 +1517,7 @@ describe("server local API auth", () => {
     process.env.OPENCODEX_API_AUTH_TOKEN = "local-secret";
 
     const seen: Array<{ host: string; authorization: string | null; chatgptAccountId: string | null }> = [];
-    const upstream = Bun.serve({
+    const upstream = startUpstream({
       port: 0,
       fetch(req) {
         const observed = {
@@ -1582,7 +1661,7 @@ describe("server local API auth", () => {
         expect(loadConfig().activeCodexAccountId).toBe(directBaseline.active);
         expect(whamRequests).toBe(directBaseline.whamRequests);
       } finally {
-        await direct.stop(true);
+        await stopCaseServer(direct);
       }
 
       const mainOnlyConfig = (): OcxConfig => ({
@@ -1616,7 +1695,7 @@ describe("server local API auth", () => {
           expect(await wsTurn(unusableMain)).toContain("401");
           expect(seen).toHaveLength(before);
         } finally {
-          await unusableMain.stop(true);
+          await stopCaseServer(unusableMain);
         }
       }
       clearAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
@@ -1694,7 +1773,7 @@ describe("server local API auth", () => {
         })));
         expect(isAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID)).toBe(true);
       } finally {
-        await nativeCaller.stop(true);
+        await stopCaseServer(nativeCaller);
         clearAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
         rmSync(join(isolatedCodexHome!.path, "auth.json"), { force: true });
       }
@@ -1718,7 +1797,7 @@ describe("server local API auth", () => {
         expect(await wsTurn(missingPool)).toContain("401");
         expect(seen).toHaveLength(beforeMissingPool);
       } finally {
-        await missingPool.stop(true);
+        await stopCaseServer(missingPool);
       }
       clearAccountNeedsReauth("pool-a");
       saveCodexAccountCredential("pool-a", {
@@ -1741,7 +1820,7 @@ describe("server local API auth", () => {
         expect((await compact(cooledMulti)).status).toBe(429);
         expect(seen).toHaveLength(beforeCooldown);
       } finally {
-        await cooledMulti.stop(true);
+        await stopCaseServer(cooledMulti);
       }
       clearCodexUpstreamHealth();
       const multi = startServer(0, { inspectNativeCodexOwnership });
@@ -1755,7 +1834,7 @@ describe("server local API auth", () => {
           chatgptAccountId: "acct-pool-a",
         });
       } finally {
-        await multi.stop(true);
+        await stopCaseServer(multi);
       }
 
       saveConfig({
@@ -1780,7 +1859,7 @@ describe("server local API auth", () => {
           chatgptAccountId: null,
         });
       } finally {
-        await api.stop(true);
+        await stopCaseServer(api);
       }
 
       saveCodexAccountCredential("pool-b", {
@@ -1863,13 +1942,13 @@ describe("server local API auth", () => {
         expect(getTrackedCodexWebSocketCountForAccount("pool-b")).toBe(1);
       } finally {
         ws.close();
-        await sequential.stop(true);
+        await stopCaseServer(sequential);
       }
     } finally {
       // Only clear our mock if a later/timeout race has not already replaced it.
       // afterEach always restores originalGlobalFetch once this test settles.
       if (globalThis.fetch === matrixFetch) globalThis.fetch = originalGlobalFetch;
-      await upstream.stop(true);
+      await stopCaseServer(upstream);
     }
   }, { timeout: SERVER_BUDGET_MS });
 
@@ -1931,7 +2010,7 @@ describe("server local API auth", () => {
       expect(outbound.every(row => row.authorization === "Bearer routed-key")).toBe(true);
     } finally {
       globalThis.fetch = originalGlobalFetch;
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   });
 
@@ -2002,7 +2081,7 @@ describe("server local API auth", () => {
       expect(chatgptCalls.every(row => row.accountId === "acct-direct")).toBe(true);
     } finally {
       globalThis.fetch = originalGlobalFetch;
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   });
 
@@ -2016,7 +2095,7 @@ describe("server local API auth", () => {
     clearAccountQuota();
 
     let upstreamRequests = 0;
-    const upstream = Bun.serve({
+    const upstream = startUpstream({
       port: 0,
       fetch() {
         upstreamRequests += 1;
@@ -2119,8 +2198,8 @@ describe("server local API auth", () => {
       expect(upstreamRequests).toBe(3);
     } finally {
       Date.now = originalNow;
-      await server.stop(true);
-      await upstream.stop(true);
+      await stopCaseServer(server);
+      await stopCaseServer(upstream);
     }
   });
 
@@ -2133,7 +2212,7 @@ describe("server local API auth", () => {
     clearAccountNeedsReauth("pool-a");
 
     const seenAuth: Array<string | null> = [];
-    const upstream = Bun.serve({
+    const upstream = startUpstream({
       port: 0,
       fetch(req) {
         seenAuth.push(req.headers.get("authorization"));
@@ -2232,8 +2311,8 @@ describe("server local API auth", () => {
     } finally {
       Date.now = originalNow;
       globalThis.fetch = originalFetch;
-      await server.stop(true);
-      await upstream.stop(true);
+      await stopCaseServer(server);
+      await stopCaseServer(upstream);
     }
   });
 
@@ -2242,7 +2321,7 @@ describe("server local API auth", () => {
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
 
-    const upstream = Bun.serve({
+    const upstream = startUpstream({
       port: 0,
       fetch() {
         return new Response([
@@ -2315,8 +2394,8 @@ describe("server local API auth", () => {
         },
       });
     } finally {
-      await server.stop(true);
-      await upstream.stop(true);
+      await stopCaseServer(server);
+      await stopCaseServer(upstream);
     }
   });
 
@@ -3609,7 +3688,7 @@ describe("server local API auth", () => {
     });
     harness.config.websockets = true;
     saveConfig(harness.config);
-    await harness.server.stop(true);
+    await stopCaseServer(harness.server);
     harness.server = startServer(0);
     const wsUrl = new URL("/v1/responses", harness.server.url);
     wsUrl.protocol = "ws:";
@@ -3694,7 +3773,7 @@ describe("server local API auth", () => {
       expect(getUpstreamHostHealth(upstreamHostHealthKey("openai", "https://chatgpt.com")))
         .toMatchObject({ consecutiveFailures: 1, lastFailureCode: expect.stringMatching(/^(?:ConnectionRefused|ECONNREFUSED)$/) });
     } finally {
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   });
 
@@ -3768,7 +3847,7 @@ describe("server local API auth", () => {
       expect(isCodexAccountSoftAvoided("pool-a")).toBe(false);
       expect(getUpstreamHostHealth(hostKey)).toBeNull();
     } finally {
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   });
 
@@ -3780,7 +3859,7 @@ describe("server local API auth", () => {
     clearThreadAccountMap();
     clearAccountNeedsReauth("pool-a");
 
-    const upstream = Bun.serve({
+    const upstream = startUpstream({
       port: 0,
       fetch() {
         return new Response(
@@ -3838,8 +3917,8 @@ describe("server local API auth", () => {
         closeReason: "terminal",
       });
     } finally {
-      await server.stop(true);
-      await upstream.stop(true);
+      await stopCaseServer(server);
+      await stopCaseServer(upstream);
     }
   }, { timeout: SERVER_BUDGET_MS });
 
@@ -3850,7 +3929,7 @@ describe("server local API auth", () => {
     clearRequestLogsForTests();
 
     const message = "This content was flagged for possible cybersecurity risk. To get authorized for security work, join the Trusted Access for Cyber program.";
-    const upstream = Bun.serve({
+    const upstream = startUpstream({
       port: 0,
       fetch() {
         return new Response([
@@ -3909,8 +3988,8 @@ describe("server local API auth", () => {
         attempts: [expect.objectContaining({ status: 400, errorCode: "cyber_policy" })],
       });
     } finally {
-      await server.stop(true);
-      await upstream.stop(true);
+      await stopCaseServer(server);
+      await stopCaseServer(upstream);
       clearRequestLogsForTests();
     }
   });
@@ -3920,7 +3999,7 @@ describe("server local API auth", () => {
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
 
-    const upstream = Bun.serve({
+    const upstream = startUpstream({
       port: 0,
       fetch() {
         return new Response(
@@ -3994,8 +4073,8 @@ describe("server local API auth", () => {
       expect(claudeUsage.surface).toBe("claude");
       expect(claudeUsage.summary.requests).toBe(0);
     } finally {
-      await server.stop(true);
-      await upstream.stop(true);
+      await stopCaseServer(server);
+      await stopCaseServer(upstream);
     }
   });
 
@@ -4056,7 +4135,7 @@ describe("server local API auth", () => {
       expect(getRequestLogEntries().find(entry => entry.requestId === requestId)).toMatchObject({ status: 499, closeReason: "client_cancel" });
     } finally {
       globalThis.fetch = originalFetch;
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   });
 
@@ -4134,7 +4213,7 @@ describe("server local API auth", () => {
     clearThreadAccountMap();
     clearAccountNeedsReauth("pool-a");
 
-    const upstream = Bun.serve({
+    const upstream = startUpstream({
       port: 0,
       fetch() {
         return new Response(
@@ -4188,8 +4267,8 @@ describe("server local API auth", () => {
       expect(text).toContain("response.failed");
       expect(getCodexUpstreamHealth("pool-a")).toBeNull();
     } finally {
-      await server.stop(true);
-      await upstream.stop(true);
+      await stopCaseServer(server);
+      await stopCaseServer(upstream);
     }
   });
 });
@@ -4223,7 +4302,7 @@ describe("GET /v1/catalog remote data plane", () => {
       expect(remote.headers.get("cache-control")).toBe("no-store");
       expect(remote.headers.get("x-opencodex-key-id")).toBe("remote-key");
     } finally {
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   });
 
@@ -4253,7 +4332,7 @@ describe("GET /v1/catalog remote data plane", () => {
         expect(response.headers.get("x-opencodex-key-id")).toBe(keyId);
       }
     } finally {
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   });
 
@@ -4269,7 +4348,7 @@ describe("GET /v1/catalog remote data plane", () => {
       expect(response.status).toBe(200);
       expect(response.headers.get("x-opencodex-key-id")).toBeNull();
     } finally {
-      await remote.stop(true);
+      await stopCaseServer(remote);
     }
 
     const loopbackConfig = remoteCatalogConfig();
@@ -4281,7 +4360,7 @@ describe("GET /v1/catalog remote data plane", () => {
       expect(response.status).toBe(200);
       expect(response.headers.get("x-opencodex-key-id")).toBeNull();
     } finally {
-      await loopback.stop(true);
+      await stopCaseServer(loopback);
     }
   });
 
@@ -4307,7 +4386,7 @@ describe("GET /v1/catalog remote data plane", () => {
       expect(remoteCatalogWarns[0]).not.toContain(unsafeId);
       expect(warnSpy.mock.calls.flat().map(String).join(" ")).not.toContain(unsafeId);
     } finally {
-      await server.stop(true);
+      await stopCaseServer(server);
       warnSpy.mockRestore();
     }
   });
@@ -4339,7 +4418,7 @@ describe("GET /v1/catalog remote data plane", () => {
         expect(response.headers.get("cache-control")).toBe("no-store");
       }
     } finally {
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   });
 
@@ -4363,7 +4442,7 @@ describe("GET /v1/catalog remote data plane", () => {
         expect(response.headers.get("x-opencodex-key-id")).toBeNull();
       }
     } finally {
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   });
 });
@@ -4408,7 +4487,7 @@ describe("POST /opencodex-session pairing body bound", () => {
       // The bound is what stopped it, not the peer running out of data.
       expect(pulled).toBeLessThan(chunkCount);
     } finally {
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   });
 
@@ -4431,7 +4510,7 @@ describe("POST /opencodex-session pairing body bound", () => {
       // 401, not 413: the body was read and parsed, and the grant simply does not exist.
       expect(response.status).toBe(401);
     } finally {
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   });
 });

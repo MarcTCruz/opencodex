@@ -23,6 +23,7 @@ function runScript(
       ...process.env,
       CODEX_HOME: codexHome,
       OPENCODEX_HOME: opencodexHome,
+      CODEX_CLI_PATH: "",
       ...extraEnv,
     },
     encoding: "utf8",
@@ -201,6 +202,7 @@ describe("Codex catalog sync hardening", () => {
         providers: { openai: {
           adapter: "openai-responses", authMode: "forward",
           baseUrl: "https://chatgpt.com/backend-api/codex", liveModels: false,
+          upstreamWebsocket: false,
         } },
         codexAccounts: [{ id: "stored-side-account", isMain: false }],
         codexAccountNamespaces: { desktop: "@main", side: "stored-side-account" },
@@ -525,7 +527,7 @@ describe("Codex catalog sync hardening", () => {
       }],
     }, null, 2) + "\n");
     writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
-      tokens: { access_token: "main-token", account_id: "main-account" },
+      tokens: { access_token: "main-token", refresh_token: "main-refresh", account_id: "main-account" },
     }), "utf8");
 
     const r = runScript(codexHome, opencodexHome, `
@@ -590,7 +592,7 @@ describe("Codex catalog sync hardening", () => {
       const config = {
         port: 10100,
         defaultProvider: "openai",
-        providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "pool" } },
+        providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "pool", upstreamWebsocket: false,} },
         codexAccountPickerEnabled: false,
         customModels: [{ id: "astra", provider: "openai", modelId: "gpt-6-astra", reasoningEfforts: ["none", "minimal", "low"], defaultReasoningEffort: "minimal" }]
       };
@@ -636,7 +638,8 @@ describe("Codex catalog sync hardening", () => {
             adapter: "openai-responses",
             baseUrl: "https://chatgpt.com/backend-api/codex",
             authMode: "forward",
-            codexAccountMode: "pool"
+            codexAccountMode: "pool",
+            upstreamWebsocket: false,
           }
         },
         defaultProvider: "openai",
@@ -1097,7 +1100,7 @@ describe("Codex catalog sync hardening", () => {
     expect(slugs).toContain("cursor/composer-2.5");
   }, 15_000);
 
-  test("drops legacy-signature ghost rows in both gather branches", () => {
+  test("drops legacy-signature ghost rows after partial gather", () => {
     const catalogPath = join(codexHome, "catalog.json");
     writeFileSync(join(codexHome, "config.toml"), 'model_catalog_json = "catalog.json"\n', "utf8");
     writeFileSync(catalogPath, JSON.stringify({
@@ -1120,11 +1123,14 @@ describe("Codex catalog sync hardening", () => {
       },
     });
     expect(partial.status).toBe(0);
-    let slugs = (JSON.parse(readFileSync(catalogPath, "utf8")).models as Array<{ slug: string }>).map(m => m.slug);
+    const slugs = (JSON.parse(readFileSync(catalogPath, "utf8")).models as Array<{ slug: string }>).map(m => m.slug);
     expect(slugs).not.toContain("future-grok/legacy-model");
     expect(slugs).toContain("cursor/composer-2.5");
+  });
 
-    // Empty-gather branch: re-seed the legacy ghost and gather nothing.
+  test("drops legacy-signature ghost rows after empty gather", () => {
+    const catalogPath = join(codexHome, "catalog.json");
+    writeFileSync(join(codexHome, "config.toml"), 'model_catalog_json = "catalog.json"\n', "utf8");
     writeFileSync(catalogPath, JSON.stringify({
       models: [
         nativeEntry("gpt-5.5", 0),
@@ -1134,12 +1140,13 @@ describe("Codex catalog sync hardening", () => {
     }, null, 2) + "\n");
     const empty = syncWithSavedConfig(codexHome, opencodexHome, { providers: {} });
     expect(empty.status).toBe(0);
-    slugs = (JSON.parse(readFileSync(catalogPath, "utf8")).models as Array<{ slug: string }>).map(m => m.slug);
+    const slugs = (JSON.parse(readFileSync(catalogPath, "utf8")).models as Array<{ slug: string }>).map(m => m.slug);
     expect(slugs).not.toContain("future-grok/legacy-model");
     expect(slugs).toContain("cursor/composer-2.5");
   });
 
-  test("drops legacy combo-alias ghost rows in both gather branches", () => {
+  test("drops legacy combo-alias ghost rows after partial gather", () => {
+    const catalogPath = join(codexHome, "catalog.json");
     const legacyComboAlias = {
       ...routedEntry("vendor/fast", 5),
       description: "Routed via opencodex → combo (combo).",
@@ -1152,7 +1159,6 @@ describe("Codex catalog sync hardening", () => {
         routedEntry("cursor/composer-2.5", 6),
       ],
     }, null, 2) + "\n");
-    const catalogPath = join(codexHome, "catalog.json");
     writeFileSync(join(codexHome, "config.toml"), 'model_catalog_json = "catalog.json"\n', "utf8");
 
     // Partial-gather branch: a PHYSICAL combo provider bypasses the generic
@@ -1172,8 +1178,23 @@ describe("Codex catalog sync hardening", () => {
     let slugs = (JSON.parse(readFileSync(catalogPath, "utf8")).models as Array<{ slug: string }>).map(m => m.slug);
     expect(slugs).not.toContain("vendor/fast");
     expect(slugs).toContain("cursor/composer-2.5");
+  });
 
-    // Empty-gather branch: physical combo present but gathers zero rows.
+  test("drops legacy combo-alias ghost rows after empty gather", () => {
+    const legacyComboAlias = {
+      ...routedEntry("vendor/fast", 5),
+      description: "Routed via opencodex → combo (combo).",
+      owned_by: "combo",
+    };
+    const catalogPath = join(codexHome, "catalog.json");
+    const seed = () => writeFileSync(catalogPath, JSON.stringify({
+      models: [
+        nativeEntry("gpt-5.5", 0),
+        legacyComboAlias,
+        routedEntry("cursor/composer-2.5", 6),
+      ],
+    }, null, 2) + "\n");
+    writeFileSync(join(codexHome, "config.toml"), 'model_catalog_json = "catalog.json"\n', "utf8");
     seed();
     const empty = syncWithSavedConfig(codexHome, opencodexHome, {
       providers: {
@@ -1186,7 +1207,7 @@ describe("Codex catalog sync hardening", () => {
       },
     });
     expect(empty.status).toBe(0);
-    slugs = (JSON.parse(readFileSync(catalogPath, "utf8")).models as Array<{ slug: string }>).map(m => m.slug);
+    const slugs = (JSON.parse(readFileSync(catalogPath, "utf8")).models as Array<{ slug: string }>).map(m => m.slug);
     expect(slugs).not.toContain("vendor/fast");
     expect(slugs).toContain("cursor/composer-2.5");
   });

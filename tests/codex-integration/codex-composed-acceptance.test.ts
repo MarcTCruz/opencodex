@@ -694,6 +694,7 @@ describe("WP13 composed toggle acceptance", () => {
     writeFileSync(join(fx.codex, "auth.json"), JSON.stringify({
       tokens: {
         access_token: `header.${expiredPayload}.signature`,
+        refresh_token: "foreign-main-refresh",
         account_id: "foreign-main-account",
       },
     }));
@@ -748,6 +749,7 @@ describe("WP13 composed toggle acceptance", () => {
     writeFileSync(join(fx.codex, "auth.json"), JSON.stringify({
       tokens: {
         access_token: "opaque-main-token",
+        refresh_token: "unknown-main-refresh",
         account_id: "unknown-main-account",
       },
     }));

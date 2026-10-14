@@ -198,7 +198,7 @@ test("an unconfirmed release may already be present in published bytes", async (
 
 test.each(["work", MAIN_CODEX_ACCOUNT_ID])("guarded release accepts the matching %s pin", async id => {
   const config = guardedPool();
-  writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({ tokens: { access_token: "fixture-native-access", account_id: "fixture-native" } }));
+  writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({ tokens: { access_token: "fixture-native-access", refresh_token: "fixture-native-refresh", account_id: "fixture-native" } }));
   await pin(config, id);
   const request = put({ accountId: null, expectedPinnedAccountId: id });
   const response = (await handleCodexAuthAPI(request, new URL(request.url), config))!;

@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   clearThreadAccountMap,
@@ -16,13 +16,14 @@ import {
   isCodexAuthContextUsable,
   resolveCodexAuthContext,
 } from "../../src/codex/auth-context";
-import { isCodexAccountUsable } from "../../src/codex/account-usability";
+import { codexAccountUnusableReason, isCodexAccountUsable } from "../../src/codex/account-usability";
 import {
   reconcileMainCodexAccountRuntimeState,
   resetMainCodexAccountIdentityTrackingForTests,
 } from "../../src/codex/account-lifecycle";
-import { MAIN_CODEX_ACCOUNT_ID, setMainAccountPlan } from "../../src/codex/main-account";
-import { saveCodexAccountCredential } from "../../src/codex/account-store";
+import { getMainAccountCredentialStatus, getValidMainAccountToken, MAIN_CODEX_ACCOUNT_ID, setMainAccountPlan } from "../../src/codex/main-account";
+import { refreshGrantFingerprintForToken, saveCodexAccountCredential } from "../../src/codex/account-store";
+import { clearMainRefreshGrantRejection, markMainRefreshGrantRejected } from "../../src/codex/account-runtime-state";
 import {
   clearAccountNeedsReauth,
   clearAccountQuota,
@@ -36,6 +37,7 @@ import {
 } from "../../src/codex/auth-api";
 import type { OcxConfig } from "../../src/types";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { writeNativeMainAuthFileForTests } from "../helpers/native-main-auth";
 
 const STORE_DIR = join(import.meta.dir, ".tmp-main-rotation-store");
 const CODEX_DIR = join(import.meta.dir, ".tmp-main-rotation-codex");
@@ -44,9 +46,9 @@ let prevCodexHome: string | undefined;
 
 function writeMainAuth(): void {
   mkdirSync(CODEX_DIR, { recursive: true });
-  writeFileSync(
+  writeNativeMainAuthFileForTests(
     join(CODEX_DIR, "auth.json"),
-    JSON.stringify({ tokens: { access_token: "main_access", account_id: "main_acct" } }),
+    JSON.stringify({ tokens: { access_token: "main_access", refresh_token: "main_refresh", account_id: "main_acct" } }),
   );
 }
 
@@ -117,13 +119,22 @@ describe("main account rotation (Option A)", () => {
   });
 
   test("main account is not usable when auth.json is absent", () => {
-    rmSync(join(CODEX_DIR, "auth.json"));
+    process.env.CODEX_HOME = join(CODEX_DIR, "empty-home");
     expect(isCodexAccountUsable(makeConfig(), MAIN_CODEX_ACCOUNT_ID)).toBe(false);
   });
 
-  test("main account is not usable when flagged needs-reauth", () => {
-    markAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
-    expect(isCodexAccountUsable(makeConfig(), MAIN_CODEX_ACCOUNT_ID)).toBe(false);
+  test("main account is not usable when its refresh grant is rejected", () => {
+    const refreshToken = "main_refresh";
+    const refreshGrantKey = `${join(CODEX_DIR, "auth.json")}:${refreshGrantFingerprintForToken(refreshToken)}`;
+    markMainRefreshGrantRejected(refreshGrantKey);
+    try {
+      expect(isCodexAccountUsable(makeConfig(), MAIN_CODEX_ACCOUNT_ID)).toBe(false);
+      expect(codexAccountUnusableReason(makeConfig(), MAIN_CODEX_ACCOUNT_ID)).toBe("needs_reauth");
+      expect(getMainAccountCredentialStatus()).toMatchObject({ refreshGrantRejected: true, hasRefreshGrant: false });
+    } finally {
+      clearMainRefreshGrantRejection(refreshGrantKey);
+      clearAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
+    }
   });
 
   test("quota auto-switch can move from a hot pool account onto the main account", () => {
@@ -145,7 +156,7 @@ describe("main account rotation (Option A)", () => {
   });
 
   test("main is excluded from rotation candidates when its token is missing", () => {
-    rmSync(join(CODEX_DIR, "auth.json"));
+    process.env.CODEX_HOME = join(CODEX_DIR, "empty-home");
     const config = makeConfig();
     updateAccountQuota("a", 90, 0);
     updateAccountQuota("b", 50, 0);
@@ -182,9 +193,9 @@ describe("main account rotation (Option A)", () => {
     recordCodexUpstreamOutcome(config, MAIN_CODEX_ACCOUNT_ID, 429, { retryAfter: "3600" });
     markAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
     updateAccountQuota(MAIN_CODEX_ACCOUNT_ID, 100, 0);
-    writeFileSync(
+    writeNativeMainAuthFileForTests(
       join(CODEX_DIR, "auth.json"),
-      JSON.stringify({ tokens: { access_token: "replacement_access", account_id: "replacement_acct" } }),
+      JSON.stringify({ tokens: { access_token: "replacement_access", refresh_token: "replacement_refresh", account_id: "replacement_acct" } }),
     );
 
     await expect(resolveCodexAuthContext(new Headers(), config, "pool")).resolves.toEqual({
@@ -214,6 +225,7 @@ describe("main account rotation (Option A)", () => {
           baseUrl: "https://chatgpt.com/backend-api/codex",
           authMode: "forward",
           codexAccountMode: "pool",
+          upstreamWebsocket: false,
         },
       },
     });
@@ -229,9 +241,9 @@ describe("main account rotation (Option A)", () => {
       recordCodexUpstreamOutcome(config, MAIN_CODEX_ACCOUNT_ID, 429, { retryAfter: "3600" });
       markAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
       updateAccountQuota(MAIN_CODEX_ACCOUNT_ID, 100, 0);
-      writeFileSync(
+      writeNativeMainAuthFileForTests(
         join(CODEX_DIR, "auth.json"),
-        JSON.stringify({ tokens: { access_token: "replacement_access", account_id: "replacement_acct" } }),
+        JSON.stringify({ tokens: { access_token: "replacement_access", refresh_token: "replacement_refresh", account_id: "replacement_acct" } }),
       );
 
       expect(reconcileMainCodexAccountRuntimeState()).toBe(true);
@@ -269,9 +281,9 @@ describe("main account rotation (Option A)", () => {
       expect(reconcileMainCodexAccountRuntimeState()).toBe(false);
       expect((await fetchMainAccountInfo(false)).email).toBe("a@example.test");
       email = "b@example.test";
-      writeFileSync(
+      writeNativeMainAuthFileForTests(
         join(CODEX_DIR, "auth.json"),
-        JSON.stringify({ tokens: { access_token: "replacement_access", account_id: "replacement_acct" } }),
+        JSON.stringify({ tokens: { access_token: "replacement_access", refresh_token: "replacement_refresh", account_id: "replacement_acct" } }),
       );
       expect(reconcileMainCodexAccountRuntimeState()).toBe(true);
       expect((await fetchMainAccountInfo(false)).email).toBe("b@example.test");
@@ -318,8 +330,8 @@ describe("main account rotation (Option A)", () => {
         expect(getAccountQuota(MAIN_CODEX_ACCOUNT_ID)?.weeklyPercent).toBe(42);
         expect(isAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID)).toBe(false);
 
-        // 4. Routing still fails closed while the file cannot be read.
-        expect(isCodexAccountUsable(makeConfig(), MAIN_CODEX_ACCOUNT_ID)).toBe(false);
+        // 4. Requests keep using the last complete credential through a filesystem hiccup.
+        expect(isCodexAccountUsable(makeConfig(), MAIN_CODEX_ACCOUNT_ID)).toBe(true);
 
         // 5. Restoring the credential brings the same identity back without a spurious reauth.
         writeMainAuth();
@@ -358,9 +370,9 @@ describe("main account rotation (Option A)", () => {
       await firstUsageEntered.promise;
       expect(requestedAccountIds).toEqual(["main_acct"]);
 
-      writeFileSync(
+      writeNativeMainAuthFileForTests(
         join(CODEX_DIR, "auth.json"),
-        JSON.stringify({ tokens: { access_token: "replacement_access", account_id: "replacement_acct" } }),
+        JSON.stringify({ tokens: { access_token: "replacement_access", refresh_token: "replacement_refresh", account_id: "replacement_acct" } }),
       );
       expect(reconcileMainCodexAccountRuntimeState()).toBe(true);
       resolveFirstUsage(new Response(JSON.stringify({
@@ -438,7 +450,7 @@ describe("main account rotation (Option A)", () => {
   });
 
   test("no active id selects an added account when the main token is unavailable", async () => {
-    rmSync(join(CODEX_DIR, "auth.json"));
+    process.env.CODEX_HOME = join(CODEX_DIR, "empty-home");
     const config = makeConfig({ activeCodexAccountId: undefined, autoSwitchThreshold: 0 });
     updateAccountQuota("a", 10, 0);
     updateAccountQuota("b", 20, 0);
@@ -447,21 +459,73 @@ describe("main account rotation (Option A)", () => {
     expect(config.activeCodexAccountId).toBe("a");
   });
 
-  test("no active id fails closed for expired, reauth-marked, or cooled main-only credentials", async () => {
+  test("an incomplete ChatGPT envelope stays unavailable under the complete-envelope rule (a)", async () => {
     const mainOnly = () => makeConfig({ activeCodexAccountId: undefined, autoSwitchThreshold: 0, codexAccounts: [] });
-    const payload = Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) - 60 })).toString("base64url");
-    writeFileSync(join(CODEX_DIR, "auth.json"), JSON.stringify({
+    const incompleteHome = join(CODEX_DIR, "incomplete-home");
+    mkdirSync(incompleteHome, { recursive: true });
+    process.env.CODEX_HOME = incompleteHome;
+    const payload = Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString("base64url");
+    writeNativeMainAuthFileForTests(join(incompleteHome, "auth.json"), JSON.stringify({
+      auth_mode: "chatgpt",
       tokens: { access_token: `header.${payload}.signature`, account_id: "main_acct" },
     }));
+    expect(isCodexAccountUsable(mainOnly(), MAIN_CODEX_ACCOUNT_ID)).toBe(false);
     await expect(resolveCodexAuthContext(new Headers(), mainOnly(), "pool"))
       .rejects.toBeInstanceOf(CodexPoolAuthenticationError);
+  });
 
+  test("an ordinary needs-reauth flag excludes a usable unrejected main grant", async () => {
+    const mainOnly = makeConfig({ activeCodexAccountId: undefined, autoSwitchThreshold: 0, codexAccounts: [] });
+    process.env.CODEX_HOME = CODEX_DIR;
     writeMainAuth();
     markAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
-    await expect(resolveCodexAuthContext(new Headers(), mainOnly(), "pool"))
-      .rejects.toBeInstanceOf(CodexPoolAuthenticationError);
+    try {
+      expect(getMainAccountCredentialStatus()).toMatchObject({ refreshGrantRejected: false, hasRefreshGrant: true, usable: true });
+      expect(isCodexAccountUsable(mainOnly, MAIN_CODEX_ACCOUNT_ID)).toBe(false);
+      await expect(resolveCodexAuthContext(new Headers(), mainOnly, "pool"))
+        .rejects.toBeInstanceOf(CodexPoolAuthenticationError);
+    } finally {
+      clearAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
+    }
+  });
 
-    clearAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
+  test("an expired complete main credential reaches the refresh exchange", async () => {
+    const expiry = Math.floor(Date.now() / 1000) - 60;
+    const payload = Buffer.from(JSON.stringify({
+      exp: expiry,
+      "https://api.openai.com/auth": { chatgpt_account_id: "main_acct" },
+    })).toString("base64url");
+    writeNativeMainAuthFileForTests(join(CODEX_DIR, "auth.json"), JSON.stringify({
+      auth_mode: "chatgpt",
+      tokens: {
+        access_token: `header.${payload}.signature`,
+        refresh_token: "main_refresh",
+        account_id: "main_acct",
+      },
+    }));
+    let refreshCalls = 0;
+    const result = await getValidMainAccountToken({
+      refreshToken: async refreshToken => {
+        refreshCalls++;
+        expect(refreshToken).toBe("main_refresh");
+        return {
+          access: "fresh-main-access",
+          refresh: "fresh-main-refresh",
+          expires: Date.now() + 3600_000,
+          accountId: "main_acct",
+        };
+      },
+    });
+    expect(refreshCalls).toBe(1);
+    expect(result).toEqual({ accessToken: "fresh-main-access", chatgptAccountId: "main_acct" });
+    expect(JSON.parse(readFileSync(join(CODEX_DIR, "auth.json"), "utf8")).tokens.refresh_token)
+      .toBe("fresh-main-refresh");
+  });
+
+  test("no active id fails closed for a cooled main-only credential", async () => {
+    const mainOnly = () => makeConfig({ activeCodexAccountId: undefined, autoSwitchThreshold: 0, codexAccounts: [] });
+    process.env.CODEX_HOME = CODEX_DIR;
+    writeMainAuth();
     recordCodexUpstreamOutcome(mainOnly(), MAIN_CODEX_ACCOUNT_ID, 429, { retryAfter: "60" });
     await expect(resolveCodexAuthContext(new Headers(), mainOnly(), "pool"))
       .rejects.toBeInstanceOf(CodexPoolAuthenticationError);
@@ -469,7 +533,7 @@ describe("main account rotation (Option A)", () => {
 
   test("active __main__ fails closed when the pool token vanishes", async () => {
     const config = makeConfig({ activeCodexAccountId: MAIN_CODEX_ACCOUNT_ID, autoSwitchThreshold: 0, codexAccounts: [] });
-    rmSync(join(CODEX_DIR, "auth.json"));
+    process.env.CODEX_HOME = join(CODEX_DIR, "empty-home");
     await expect(resolveCodexAuthContext(new Headers(), config, "pool")).rejects.toThrow(
       "no usable account credential",
     );

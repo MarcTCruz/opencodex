@@ -5,7 +5,7 @@
  * sequence it is, rather than doubling in length around the lock.
  */
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, unlinkSync } from "node:fs";
 
 import { publishCodexArtifact } from "./inject/config-write-section";
 import { withConfigWriteLockHeld, type LockHandle } from "./config-write-lock";
@@ -385,7 +385,7 @@ export function restoreCodexPreImages(
       publishCodexArtifact(path, held, (destination, hooks) => {
         if (bytes === null) {
           hooks.validateBeforeRename?.(destination);
-          if (existsSync(destination)) require("node:fs").unlinkSync(destination);
+          if (existsSync(destination)) unlinkSync(destination);
           hooks.afterRename?.(destination);
         } else if (readOrNull(destination) !== bytes) atomicWriteFile(destination, bytes, undefined, hooks);
       });

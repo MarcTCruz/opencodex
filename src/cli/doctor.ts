@@ -25,6 +25,7 @@ import { readInstalledServiceToken } from "../lib/service-secrets";
 import { PROXY_ENV_KEYS, proxyEnvPresent } from "../lib/proxy-env";
 import { LOCAL_MANAGEMENT_READ_PATHS } from "../lib/local-management-capability";
 import { readCodexTokens } from "../codex/auth-collision";
+import { observeNativeMainAuthFile } from "../codex/native-main-credentials";
 import { withNativeMainSharedClaim } from "../codex/native-main-claim";
 import { probeNativeProfileRecoveryState, resolveNativeProfileContext } from "../codex/native-profile-store";
 import { NativeProfileError } from "../codex/native-profile-types";
@@ -308,12 +309,20 @@ const PROBE_TIMEOUT_MS = 8000;
 
 export type PathRow = { label: string; path: string; exists: boolean };
 
+function nativeMainAuthPathExists(path: string): boolean {
+  const observation = observeNativeMainAuthFile(path);
+  const exists = observation.fileStatus !== "missing";
+  observation.snapshot?.raw.fill(0);
+  observation.raw?.fill(0);
+  return exists;
+}
+
 export function collectPaths(): PathRow[] {
   const codexHome = resolveCodexHomeDirImpl();
   const opencodexHome = getConfigDir();
   return [
     { label: "CODEX_HOME", path: codexHome, exists: existsSync(codexHome) },
-    { label: "CODEX_HOME/auth.json", path: join(codexHome, "auth.json"), exists: existsSync(join(codexHome, "auth.json")) },
+    { label: "CODEX_HOME/auth.json", path: join(codexHome, "auth.json"), exists: nativeMainAuthPathExists(join(codexHome, "auth.json")) },
     { label: "OPENCODEX_HOME", path: opencodexHome, exists: existsSync(opencodexHome) },
     { label: "OPENCODEX_HOME/config.json", path: getConfigPath(), exists: existsSync(getConfigPath()) },
   ];

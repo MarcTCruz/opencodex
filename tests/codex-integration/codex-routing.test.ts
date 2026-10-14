@@ -492,7 +492,7 @@ describe("codex routing", () => {
 
   test("missing OpenAI mode defaults to pool and rotates from hot main to a cool added account", () => {
     writeFileSync(join(TEST_DIR, "auth.json"), JSON.stringify({
-      tokens: { access_token: "main-access", account_id: "main-chatgpt-id" },
+      tokens: { access_token: "main-access", refresh_token: "main-refresh", account_id: "main-chatgpt-id" },
     }));
     const config = makeConfig({
       providers: {
@@ -571,7 +571,7 @@ describe("codex routing", () => {
 
   test("paused main account is excluded even when it is the active and lowest-usage candidate", () => {
     writeFileSync(join(TEST_DIR, "auth.json"), JSON.stringify({
-      tokens: { access_token: "main-access", account_id: "main-chatgpt-id" },
+      tokens: { access_token: "main-access", refresh_token: "main-refresh", account_id: "main-chatgpt-id" },
     }));
     const config = makeConfig({
       codexAccounts: [{ id: "a", email: "a@test", isMain: false }],
@@ -977,7 +977,7 @@ describe("codex routing", () => {
     // separate re-insertion branch. That branch is the only place an avoidance window can
     // exclude it, and it is the case the pool filters above cannot cover.
     writeFileSync(join(TEST_DIR, "auth.json"), JSON.stringify({
-      tokens: { access_token: "main-access", account_id: "main-chatgpt-id" },
+      tokens: { access_token: "main-access", refresh_token: "main-refresh", account_id: "main-chatgpt-id" },
     }));
     const config = makeConfig({
       codexAccounts: [{ id: "a", email: "a@test", isMain: false }],

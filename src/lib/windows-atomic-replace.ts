@@ -38,7 +38,11 @@ export type ReplacePublisher =
   | "tray";
 
 /** Called immediately before every rename attempt, including each Windows retry. */
-export interface RenameValidationHooks { validateBeforeRename?: (destination: string) => void }
+export interface RenameValidationHooks {
+  validateBeforeRename?: (destination: string) => void;
+  validateBeforeRenameAttempt?: (destination: string, source: string) => void;
+  afterReplace?: () => void;
+}
 
 /** The Windows error codes this module treats as a momentary hold. */
 export type ReplaceRetryCode = "EBUSY" | "EPERM" | "EACCES";
@@ -149,7 +153,10 @@ export function renameAtomicFile(
   retryWindowsFileOperation({
     run: () => io.rename(source, destination),
     onRetry: (code, exhausted) => bump(publisher, code, exhausted ? "exhausted" : "retried"),
-    beforeAttempt: () => hooks.validateBeforeRename?.(destination),
+    beforeAttempt: () => {
+      hooks.validateBeforeRename?.(destination);
+      hooks.validateBeforeRenameAttempt?.(destination, source);
+    },
   }, io);
 }
 
@@ -161,9 +168,9 @@ export async function renameAtomicFileAsync(
 ): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
     hooks.validateBeforeRename?.(destination);
+    hooks.validateBeforeRenameAttempt?.(destination, source);
     try {
       renameSync(source, destination);
-      return;
     } catch (error) {
       const code = transientWindowsReplaceCode(process.platform, error);
       if (!code) throw error;
@@ -173,6 +180,9 @@ export async function renameAtomicFileAsync(
       }
       bump(publisher, code, "retried");
       await Bun.sleep(25 * (attempt + 1));
+      continue;
     }
+    hooks.afterReplace?.();
+    return;
   }
 }

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { writeNativeMainAuthFileForTests } from "../helpers/native-main-auth";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,6 +34,7 @@ let now: number;
 function config(): OcxConfig {
   return { defaultProvider: "openai", codexMainAccountHardLock: true, providers: { openai: {
     adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "pool",
+    upstreamWebsocket: false,
   } }, codexAccounts: [], codexQuotaAutoRefresh: { [MAIN]: { fiveHour: true, weekly: true } } };
 }
 
@@ -43,7 +45,7 @@ function bearer(expired = false): string {
 }
 
 function writeMain(accessToken = bearer(), workspace = accountId): void {
-  writeFileSync(join(home, "auth.json"), JSON.stringify({ tokens: {
+  writeNativeMainAuthFileForTests(join(home, "auth.json"), JSON.stringify({ tokens: {
     access_token: accessToken, refresh_token: "fixture-refresh", account_id: workspace,
   } }));
 }
@@ -164,7 +166,7 @@ describe("quota auto-refresh native-main admission", () => {
     expect(getNativeMainProfileRequestCount()).toBe(0);
   });
 
-  test.each(["bearer", "workspace", "missing"] as const)(
+  test.each(["bearer", "workspace", "partial-write"] as const)(
     "%s replacement during main SSE cannot publish old quota or completion markers", async change => {
       const cfg = config();
       const entered = deferred<void>();
@@ -182,7 +184,7 @@ describe("quota auto-refresh native-main admission", () => {
       try {
         await Promise.race([entered.promise, run.then(() => { throw new Error("SSE was never reached"); })]);
         const workspace = change === "workspace" ? "fixture-replacement-workspace" : accountId;
-        if (change === "missing") writeFileSync(join(home, "auth.json"), "{}");
+        if (change === "partial-write") writeNativeMainAuthFileForTests(join(home, "auth.json"), "{}");
         else writeMain("fixture-replacement-token", workspace);
         reconcileMainCodexAccountRuntimeState();
         const writer = captureMainQuotaWriter(workspace);
@@ -195,10 +197,28 @@ describe("quota auto-refresh native-main admission", () => {
         controller.close();
         await run;
         expect(calls).toEqual([responsesUrl]);
-        expect(getAccountQuota(MAIN)).toEqual(quotaBefore);
-        expect(getMainPolicyQuota()).toEqual(policyBefore);
-        expect(cfg.codexQuotaAutoRefresh?.[MAIN]?.lastFiveHourResetAt).toBeUndefined();
-        expect(cfg.codexQuotaAutoRefresh?.[MAIN]?.lastWeeklyResetAt).toBeUndefined();
+        if (change === "partial-write") {
+          const expectedQuota = {
+            shortPercent: 0,
+            shortWindowSeconds: 18_000,
+            shortResetAt: RESET_SECONDS + 18_000,
+            weeklyPercent: 0,
+            weeklyResetAt: RESET_SECONDS,
+          };
+          expect(getAccountQuota(MAIN)).toMatchObject(expectedQuota);
+          expect(getMainPolicyQuota()).toMatchObject(expectedQuota);
+          expect(cfg.codexQuotaAutoRefresh?.[MAIN]).toEqual({
+            fiveHour: true,
+            weekly: true,
+            lastFiveHourResetAt: RESET_MILLISECONDS,
+            lastWeeklyResetAt: RESET_MILLISECONDS,
+          });
+        } else {
+          expect(getAccountQuota(MAIN)).toEqual(quotaBefore);
+          expect(getMainPolicyQuota()).toEqual(policyBefore);
+          expect(cfg.codexQuotaAutoRefresh?.[MAIN]?.lastFiveHourResetAt).toBeUndefined();
+          expect(cfg.codexQuotaAutoRefresh?.[MAIN]?.lastWeeklyResetAt).toBeUndefined();
+        }
         expect(isAccountNeedsReauth(MAIN)).toBe(false);
         expect(getNativeMainProfileRequestCount()).toBe(0);
       } finally {
@@ -353,12 +373,12 @@ describe("quota auto-refresh native-main admission", () => {
     expect(cfg.codexQuotaAutoRefresh?.[MAIN]?.lastWeeklyResetAt).toBe(RESET_MILLISECONDS);
   });
 
-  test.each(["bearer", "workspace", "missing", "policy", "pause", "reauth"] as const)("%s changing at shared-claim acquisition skips inference and markers", async change => {
+  test.each(["bearer", "workspace", "partial-write", "policy", "pause", "reauth"] as const)("%s changing at shared-claim acquisition respects the current credential state", async change => {
     const cfg = config();
     const restore = interceptShared(() => {
       if (change === "bearer") writeMain("fixture-replacement-token");
       else if (change === "workspace") writeMain(bearer(), "fixture-other-workspace");
-      else if (change === "missing") writeFileSync(join(home, "auth.json"), "{}");
+      else if (change === "partial-write") writeNativeMainAuthFileForTests(join(home, "auth.json"), "{}");
       else if (change === "policy") observe(99);
       else if (change === "pause") cfg.pausedCodexAccountIds = [MAIN];
       else markAccountNeedsReauth(MAIN);
@@ -366,8 +386,17 @@ describe("quota auto-refresh native-main admission", () => {
     const calls = installFetch(async () => completedResponse());
     try {
       await runCodexQuotaAutoRefresh(cfg, now, { persistCompleted: recordMarkers });
-      expect(calls).toEqual([]);
-      expect(cfg.codexQuotaAutoRefresh?.[MAIN]).toEqual({ fiveHour: true, weekly: true });
+      expect(calls).toEqual(change === "partial-write" ? [responsesUrl] : []);
+      if (change === "partial-write") {
+        expect(cfg.codexQuotaAutoRefresh?.[MAIN]).toEqual({
+          fiveHour: true,
+          weekly: true,
+          lastFiveHourResetAt: RESET_MILLISECONDS,
+          lastWeeklyResetAt: RESET_MILLISECONDS,
+        });
+      } else {
+        expect(cfg.codexQuotaAutoRefresh?.[MAIN]).toEqual({ fiveHour: true, weekly: true });
+      }
       expect(getNativeMainProfileRequestCount()).toBe(0);
     } finally { restore(); }
     writeMain();

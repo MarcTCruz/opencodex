@@ -45,6 +45,7 @@ import { setIcaclsRunnerForTests } from "../../src/lib/windows-secret-acl";
 import type { OcxConfig } from "../../src/types";
 import { COLD_SPAWN_WARMUP_HOOK_BUDGET_MS, warmModuleGraph } from "../helpers/cold-spawn-warmup";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { writeNativeMainAuthFileForTests } from "../helpers/native-main-auth";
 import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
 import { helperPath, repoRoot } from "../helpers/repo-root";
 import { INTERNAL_DEADLINE_MS, SPAWN_BUDGET_MS } from "../helpers/test-budget";
@@ -76,6 +77,7 @@ function config(): OcxConfig {
       baseUrl: "https://chatgpt.com/backend-api/codex",
       authMode: "forward",
       codexAccountMode: "pool",
+      upstreamWebsocket: false,
     } },
     codexAccounts: [],
   };
@@ -86,7 +88,7 @@ function accountZeroConfig(): OcxConfig {
 }
 
 function writeMain(token = bearer()): void {
-  writeFileSync(join(home, "auth.json"), JSON.stringify({
+  writeNativeMainAuthFileForTests(join(home, "auth.json"), JSON.stringify({
     tokens: { access_token: token, refresh_token: "fixture-refresh", account_id: accountId },
   }));
   reconcileMainCodexAccountRuntimeState();
@@ -240,6 +242,7 @@ describe("main quota policy at native admission", () => {
       if (scenario.startsWith("invalid-") || scenario === "mismatched-identity") {
         writeFileSync(join(home, "auth.json"), JSON.stringify({ tokens: {
           access_token: scenario === "invalid-access-token" ? 17 : bearer(),
+          refresh_token: "fixture-refresh",
           account_id: scenario === "invalid-account-id" ? { invalid: true }
             : scenario === "mismatched-identity" ? "conflicting-physical-account" : accountId,
           ...(scenario === "invalid-id-token" ? { id_token: 17 } : {}),
@@ -247,7 +250,7 @@ describe("main quota policy at native admission", () => {
       }
       if (scenario === "conflicting-token-identities" || scenario === "conflicting-claims" || scenario === "owned-opaque-99") {
         writeFileSync(join(home, "auth.json"), JSON.stringify({ tokens: {
-          access_token: restoredBearer, account_id: accountId,
+          access_token: restoredBearer, refresh_token: "fixture-restored-refresh", account_id: accountId,
           ...(scenario === "conflicting-token-identities" ? { id_token: bearer() } : {}),
         } }));
       }
@@ -289,9 +292,10 @@ describe("main quota policy at native admission", () => {
       } else {
         expect(result.firstAdmission).toEqual({ admitted: false, error: "CodexMainProfileDrainingError" });
         expect(result.settled.status).toBe("ready");
-        // Every owned startup reads the pinned file before it can accept or reject a binding, so
-        // policyReadsPinned above cannot pass on an empty read list.
-        expect(result.after.tokenReads).toBeGreaterThan(0);
+        // The central observer is the sole disk reader. A file with no string token never reaches
+        // the memory accessor; parsed credentials must still be read through the pinned path.
+        if (scenario === "invalid-access-token") expect(result.after.tokenReads).toBe(0);
+        else expect(result.after.tokenReads).toBeGreaterThan(0);
       }
       if (unowned || unverified) {
         expect(result.after).toMatchObject({ matched: false, policy: null });
@@ -627,6 +631,7 @@ describe("main quota policy at native admission", () => {
     cfg.providers["fixture-native"] = {
       adapter: "openai-responses", authMode: "forward",
       baseUrl: "https://chatgpt.com/backend-api/codex",
+      upstreamWebsocket: false,
     };
     cfg.providers.independent = {
       adapter: "openai-responses", authMode: "key",

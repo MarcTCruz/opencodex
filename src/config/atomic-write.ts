@@ -6,11 +6,13 @@ import {
   fstatSync,
   lstatSync,
   openSync,
+  readFileSync,
   realpathSync,
   truncateSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { basename, dirname, join } from "node:path";
 import { recordOwnedConfigPath } from "../lib/config-ownership";
 import { assertNotRealCodexHomeUnderTest, assertNotRealHomeUnderTest } from "../lib/test-home-guard";
@@ -72,9 +74,24 @@ export interface AtomicWriteIO {
 export interface AtomicWriteHooks {
   afterTempWrite?: (tempPath: string, targetPath: string) => void;
   beforeRename?: (tempPath: string, targetPath: string) => void;
-  validateBeforeRename?: (targetPath: string) => void;
+  validateBeforeRename?: (targetPath: string, replacementIdentity?: AtomicWriteTargetIdentity) => void;
   /** Publication receipt; runs before any post-rename cleanup can fail. */
-  afterRename?: (targetPath: string) => void;
+  afterRename?: (targetPath: string, identity?: AtomicWriteTargetIdentity) => void;
+  afterRenameEvidence?: (targetPath: string, evidence: AtomicWritePublicationEvidence) => void;
+}
+
+export interface AtomicWriteTargetIdentity {
+  dev: number;
+  ino: number;
+  size: number;
+  mode: number;
+  mtimeMs: number;
+  ctimeMs: number;
+}
+
+export interface AtomicWritePublicationEvidence {
+  identity: AtomicWriteTargetIdentity;
+  digest: string;
 }
 
 export class AtomicWriteResidualTempError extends Error {
@@ -291,6 +308,18 @@ function atomicWriteFileToTarget(
   const tmp = `${target}.ocx.${process.pid}.${nextAtomicTempSequence()}.tmp`;
   let hardened = false;
   let ownsTemp = false;
+  let replacementIdentity: AtomicWriteTargetIdentity | undefined;
+  let publicationDescriptor: number | undefined;
+  const validateRenameAttempt = (destination: string, source: string): void => {
+    let currentIdentity: AtomicWriteTargetIdentity | undefined;
+    if (replacementIdentity) {
+      currentIdentity = atomicWriteTargetIdentity(source);
+      if (currentIdentity.dev !== replacementIdentity.dev || currentIdentity.ino !== replacementIdentity.ino) {
+        throw new Error("atomic replacement temporary file identity changed before rename");
+      }
+    }
+    hooks.validateBeforeRename?.(destination, currentIdentity);
+  };
   const effective: AtomicWriteIO = io ?? {
     write: (tempPath, value) => writePrivateTempFile(tempPath, value, path, () => { ownsTemp = true; }),
     harden: tempPath => {
@@ -304,7 +333,9 @@ function atomicWriteFileToTarget(
       }
       try { chmodSync(tempPath, 0o600); } catch { /* platform may ignore chmod */ }
     },
-    rename: (source, destination) => renameAtomicFile(source, destination, undefined, "config", hooks),
+    rename: (source, destination) => renameAtomicFile(source, destination, undefined, "config", {
+      validateBeforeRenameAttempt: validateRenameAttempt,
+    }),
     truncate: tempPath => truncateSync(tempPath, 0),
     unlink: unlinkSync,
   };
@@ -319,9 +350,25 @@ function atomicWriteFileToTarget(
     effective.harden(tmp);
     hardened = true;
     hooks.beforeRename?.(tmp, target);
-    hooks.validateBeforeRename?.(target);
-    effective.rename(tmp, target);
-    hooks.afterRename?.(target);
+    replacementIdentity = hooks.afterRename || hooks.afterRenameEvidence ? atomicWriteTargetIdentity(tmp) : undefined;
+    hooks.validateBeforeRename?.(target, replacementIdentity);
+    if (hooks.afterRenameEvidence) {
+      publicationDescriptor = openSync(tmp, "r");
+      const openedIdentity = atomicWriteDescriptorIdentity(publicationDescriptor);
+      if (!sameAtomicWriteTargetIdentity(openedIdentity, replacementIdentity)) {
+        throw new Error("atomic publication descriptor changed before rename");
+      }
+    }
+    const renameResult: unknown = effective.rename(tmp, target);
+    if (hooks.afterRenameEvidence && renameResult !== undefined
+      && typeof (renameResult as { then?: unknown }).then === "function") {
+      void Promise.resolve(renameResult).catch(() => {});
+      throw new Error("injected atomic rename did not capture publication evidence synchronously");
+    }
+    const publicationEvidence = publicationDescriptor !== undefined && hooks.afterRenameEvidence
+      ? atomicWritePublicationEvidence(publicationDescriptor) : undefined;
+    if (replacementIdentity) hooks.afterRename?.(target, replacementIdentity);
+    if (publicationEvidence) hooks.afterRenameEvidence?.(target, publicationEvidence);
     // The rename is only as durable as the directory entry recording it. Fsyncing the temp's
     // CONTENT and then losing the entry in a power cut leaves the old file in place, or the
     // directory in an indeterminate state, while the caller was told the replacement landed.
@@ -362,6 +409,8 @@ function atomicWriteFileToTarget(
     if (removed) forgetEphemeralSecretPath(tmp);
     if (!removed) throw new AtomicWriteResidualTempError(tmp, hardened, { cause });
     throw cause;
+  } finally {
+    if (publicationDescriptor !== undefined) closeSync(publicationDescriptor);
   }
 }
 
@@ -421,7 +470,7 @@ export function atomicWriteFileNoFollowUnclaimed(path: string, content: string):
 export interface AtomicWriteAsyncIO {
   write: (path: string, content: string) => void | Promise<void>;
   harden: (path: string) => void | Promise<void>;
-  rename: (source: string, destination: string) => void | Promise<void>;
+  rename: (source: string, destination: string, afterReplace?: () => void) => void | Promise<void>;
   truncate: (path: string) => void | Promise<void>;
   unlink: (path: string) => void | Promise<void>;
 }
@@ -430,13 +479,39 @@ export interface AtomicWriteAsyncTestSeam {
   afterTempWrite?: (tempPath: string) => void | Promise<void>;
 }
 
+export interface AtomicWriteAsyncHooks {
+  beforeRename?: (targetPath: string) => void | Promise<void>;
+  validateBeforeRename?: (targetPath: string, replacementIdentity?: AtomicWriteTargetIdentity) => void | Promise<void>;
+  afterRename?: (targetPath: string, identity?: AtomicWriteTargetIdentity) => void | Promise<void>;
+  afterRenameEvidence?: (targetPath: string, evidence: AtomicWritePublicationEvidence) => void | Promise<void>;
+}
+
 export async function atomicWriteFileAsync(
   path: string,
   content: string,
   io?: AtomicWriteAsyncIO,
   testSeam?: AtomicWriteAsyncTestSeam,
+  hooks: AtomicWriteAsyncHooks = {},
 ): Promise<void> {
   let ownsTemp = false;
+  let replacementIdentity: AtomicWriteTargetIdentity | undefined;
+  let publicationDescriptor: number | undefined;
+  let publicationEvidence: AtomicWritePublicationEvidence | undefined;
+  const capturePublicationEvidence = (): void => {
+    if (publicationEvidence === undefined && publicationDescriptor !== undefined && hooks.afterRenameEvidence) {
+      publicationEvidence = atomicWritePublicationEvidence(publicationDescriptor);
+    }
+  };
+  const validateRenameAttempt = (destination: string, source: string): void => {
+    let currentIdentity: AtomicWriteTargetIdentity | undefined;
+    if (replacementIdentity) {
+      currentIdentity = atomicWriteTargetIdentity(source);
+      if (currentIdentity.dev !== replacementIdentity.dev || currentIdentity.ino !== replacementIdentity.ino) {
+        throw new Error("atomic replacement temporary file identity changed before rename");
+      }
+    }
+    hooks.validateBeforeRename?.(destination, currentIdentity);
+  };
   const effective: AtomicWriteAsyncIO = io ?? {
     write: (tempPath, value) => writePrivateTempFileAsync(tempPath, value, path, () => { ownsTemp = true; }),
     harden: async tempPath => {
@@ -447,7 +522,13 @@ export async function atomicWriteFileAsync(
       }
       try { chmodSync(tempPath, 0o600); } catch { /* platform may ignore chmod */ }
     },
-    rename: renameAtomicFileAsync,
+    rename: (source, destination) => renameAtomicFileAsync(source, destination, "config", {
+      validateBeforeRenameAttempt: validateRenameAttempt,
+      // renameAtomicFileAsync calls this synchronously in the same stack as renameSync.
+      // Keep publication evidence capture here so its first fstat is the first operation
+      // after rename returns; do not move it behind the async rename's promise continuation.
+      afterReplace: capturePublicationEvidence,
+    }),
     truncate: target => truncateSync(target, 0),
     unlink: unlinkSync,
   };
@@ -463,7 +544,51 @@ export async function atomicWriteFileAsync(
     await testSeam?.afterTempWrite?.(tmp);
     await effective.harden(tmp);
     hardened = true;
-    await effective.rename(tmp, target);
+    await hooks.beforeRename?.(target);
+    replacementIdentity = hooks.afterRename || hooks.afterRenameEvidence ? atomicWriteTargetIdentity(tmp) : undefined;
+    await hooks.validateBeforeRename?.(target, replacementIdentity);
+    if (hooks.afterRenameEvidence) {
+      publicationDescriptor = openSync(tmp, "r");
+      const openedIdentity = atomicWriteDescriptorIdentity(publicationDescriptor);
+      if (!sameAtomicWriteTargetIdentity(openedIdentity, replacementIdentity)) {
+        throw new Error("atomic publication descriptor changed before rename");
+      }
+    }
+    if (io) {
+      let renameCallActive = true;
+      let evidenceFailure: unknown;
+      let renameResult: void | Promise<void>;
+      try {
+        renameResult = io.rename(tmp, target, () => {
+          if (!renameCallActive) return;
+          try {
+            if (publicationDescriptor === undefined || !hooks.afterRenameEvidence) return;
+            const evidence = atomicWritePublicationEvidence(publicationDescriptor);
+            const publishedIdentity = atomicWriteTargetIdentity(target);
+            if (!sameAtomicWriteTargetIdentity(evidence.identity, publishedIdentity)) {
+              throw new Error("injected atomic rename evidence preceded publication");
+            }
+            publicationEvidence = evidence;
+          } catch (error) {
+            evidenceFailure = error;
+          }
+        });
+      } finally {
+        renameCallActive = false;
+      }
+      await renameResult;
+      if (evidenceFailure) throw evidenceFailure;
+      if (hooks.afterRenameEvidence && publicationEvidence === undefined) {
+        throw new Error("injected atomic rename did not capture publication evidence synchronously");
+      }
+    } else {
+      await effective.rename(tmp, target);
+      if (hooks.afterRenameEvidence && publicationEvidence === undefined) {
+        throw new Error("atomic rename did not capture publication evidence synchronously");
+      }
+    }
+    if (replacementIdentity) await hooks.afterRename?.(target, replacementIdentity);
+    if (publicationEvidence) await hooks.afterRenameEvidence?.(target, publicationEvidence);
     forgetEphemeralSecretPath(tmp);
   } catch (cause) {
     if (!ownsTemp) throw cause;
@@ -502,5 +627,55 @@ export async function atomicWriteFileAsync(
     if (removed) forgetEphemeralSecretPath(tmp);
     if (!removed) throw new AtomicWriteResidualTempError(tmp, hardened, { cause });
     throw cause;
+  } finally {
+    if (publicationDescriptor !== undefined) closeSync(publicationDescriptor);
   }
+}
+
+function atomicWriteTargetIdentity(path: string): AtomicWriteTargetIdentity {
+  const stat = lstatSync(path);
+  if (!stat.isFile()) throw new Error("atomic replacement temporary file is not regular");
+  return atomicWriteIdentityFromStat(stat);
+}
+
+function atomicWriteDescriptorIdentity(descriptor: number): AtomicWriteTargetIdentity {
+  const stat = fstatSync(descriptor);
+  if (!stat.isFile()) throw new Error("atomic publication descriptor is not regular");
+  return atomicWriteIdentityFromStat(stat);
+}
+
+function atomicWriteIdentityFromStat(stat: ReturnType<typeof fstatSync>): AtomicWriteTargetIdentity {
+  return {
+    dev: Number(stat.dev),
+    ino: Number(stat.ino),
+    size: Number(stat.size),
+    mode: Number(stat.mode),
+    mtimeMs: Number(stat.mtimeMs),
+    ctimeMs: Number(stat.ctimeMs),
+  };
+}
+
+function sameAtomicWriteTargetIdentity(
+  left: AtomicWriteTargetIdentity,
+  right: AtomicWriteTargetIdentity | undefined,
+): boolean {
+  return !!right
+    && left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && left.mode === right.mode
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs;
+}
+
+function atomicWritePublicationEvidence(descriptor: number): AtomicWritePublicationEvidence {
+  const before = atomicWriteDescriptorIdentity(descriptor);
+  const bytes = readFileSync(descriptor);
+  const digest = createHash("sha256").update(bytes).digest("hex");
+  const after = atomicWriteDescriptorIdentity(descriptor);
+  bytes.fill(0);
+  if (!sameAtomicWriteTargetIdentity(before, after) || after.size !== bytes.byteLength) {
+    throw new Error("atomic publication changed while evidence was captured");
+  }
+  return { identity: after, digest };
 }

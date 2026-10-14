@@ -1,5 +1,5 @@
-import { readFileSync, statSync, type BigIntStats } from 'node:fs';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
+import { observeNativeMainAuthFile } from '../native-main-credentials';
 import type { UsageIdentity } from './usage-controller';
 
 type Credential = { identity: UsageIdentity; accessToken: string };
@@ -9,26 +9,33 @@ const equal = (a: UsageIdentity, b: UsageIdentity) => a.id === b.id && a.userId 
 /** Local native credentials remain in memory and are never returned by the public reader. */
 export function createNativeIdentityReader(authPath: string, upstreamFetch: typeof fetch = fetch) {
   const readerId = randomUUID(); let generation = 0, previousSnapshot: string | undefined;
-  const stamp = (value: BigIntStats) =>
-    `${value.dev}:${value.ino}:${value.size}:${value.mtimeNs}:${value.ctimeNs}`;
   const readCredential = (): Credential => {
-    const before = statSync(authPath, { bigint: true });
-    if (before.size > 1048576n) throw new Error('Unexpected native auth size');
-    const text = readFileSync(authPath, 'utf8'), after = statSync(authPath, { bigint: true });
-    if (stamp(before) !== stamp(after)) throw new Error('Native credentials changed during read');
-    const snapshot = `${stamp(after)}:${createHash('sha256').update(text).digest('hex')}`;
-    if (snapshot !== previousSnapshot) { previousSnapshot = snapshot; generation++; }
-    const auth = JSON.parse(text);
-    if (auth.auth_mode !== 'chatgpt' || typeof auth.tokens?.id_token !== 'string'
-      || typeof auth.tokens?.access_token !== 'string' || !auth.tokens.access_token
-      || typeof auth.tokens?.account_id !== 'string') throw new Error('Native login required');
-    // These local claims are only a binding hint. Activation additionally verifies upstream.
-    const claims = JSON.parse(Buffer.from(auth.tokens.id_token.split('.')[1], 'base64url').toString('utf8'))['https://api.openai.com/auth'];
-    if (!claims || claims.chatgpt_account_id !== auth.tokens.account_id
-      || typeof claims.chatgpt_user_id !== 'string' || !claims.chatgpt_user_id
-      || !['plus', 'pro'].includes(claims.chatgpt_plan_type)) throw new Error('Unsupported identity');
-    return { identity: { id: auth.tokens.account_id, userId: claims.chatgpt_user_id,
-      plan: claims.chatgpt_plan_type, structure: 'personal', credentialGeneration: `${readerId}:${generation}` }, accessToken: auth.tokens.access_token };
+    const read = observeNativeMainAuthFile(authPath);
+    try {
+      const snapshot = read.snapshot;
+      if (read.status !== 'ok' || read.fileStatus !== 'valid' || !snapshot) throw new Error('Native login required');
+      if (snapshot.size > 1048576) throw new Error('Unexpected native auth size');
+      const text = snapshot.raw.toString('utf8');
+      const key = `${snapshot.identity.dev}:${snapshot.identity.ino}:${snapshot.size}:${snapshot.mtimeMs}:${snapshot.ctimeMs}:${snapshot.digest}`;
+      if (key !== previousSnapshot) {
+        previousSnapshot = key;
+        generation++;
+      }
+      const auth = JSON.parse(text);
+      if (auth.auth_mode !== 'chatgpt' || typeof auth.tokens?.id_token !== 'string'
+        || typeof auth.tokens?.access_token !== 'string' || !auth.tokens.access_token
+        || typeof auth.tokens?.account_id !== 'string') throw new Error('Native login required');
+      // These local claims are only a binding hint. Activation additionally verifies upstream.
+      const claims = JSON.parse(Buffer.from(auth.tokens.id_token.split('.')[1], 'base64url').toString('utf8'))['https://api.openai.com/auth'];
+      if (!claims || claims.chatgpt_account_id !== auth.tokens.account_id
+        || typeof claims.chatgpt_user_id !== 'string' || !claims.chatgpt_user_id
+        || !['plus', 'pro'].includes(claims.chatgpt_plan_type)) throw new Error('Unsupported identity');
+      return { identity: { id: auth.tokens.account_id, userId: claims.chatgpt_user_id,
+        plan: claims.chatgpt_plan_type, structure: 'personal', credentialGeneration: `${readerId}:${generation}` }, accessToken: auth.tokens.access_token };
+    } finally {
+      read.raw?.fill(0);
+      read.snapshot?.raw.fill(0);
+    }
   };
   const readCurrentIdentity = async (): Promise<UsageIdentity | null> => {
     try { return readCredential().identity; } catch { return null; }

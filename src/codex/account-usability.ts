@@ -95,7 +95,7 @@ export function codexAccountUnusableReason(
     }
     const credential = getMainAccountCredentialStatus();
     if (credential.refreshGrantRejected) return "needs_reauth";
-    if (isAccountNeedsReauth(accountId) && !credential.hasRefreshGrant) return "needs_reauth";
+    if (isAccountNeedsReauth(accountId)) return "needs_reauth";
     // Main account: a refresh grant is enough to route; materialization refreshes before I/O.
     const mainLive = options.isMainAccountTokenLive
       ? options.isMainAccountTokenLive()

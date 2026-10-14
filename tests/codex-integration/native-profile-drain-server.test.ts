@@ -29,20 +29,34 @@ import { removeTreeWithRetry } from "../helpers/remove-tree";
 /** These cases sandbox CODEX_HOME/OPENCODEX_HOME, so the installed service is not their evidence. */
 const inspectNativeCodexOwnership = ownedServiceHomeInspection("native-profile drain server test");
 
-const originalFetch = globalThis.fetch;
+const initialFetch = globalThis.fetch;
 const previousOpencodexHome = process.env.OPENCODEX_HOME;
 const previousCodexHome = process.env.CODEX_HOME;
 let opencodexHome = "";
 let codexHome = "";
+type TestServerHandle = { stop(closeActive?: boolean): void | Promise<void> };
+const acquiredServers = new Set<TestServerHandle>();
+
+function trackServer<T extends TestServerHandle>(server: T): T {
+  acquiredServers.add(server);
+  return server;
+}
+
+async function stopTrackedServer(server: TestServerHandle): Promise<void> {
+  if (!acquiredServers.has(server)) return;
+  await server.stop(true);
+  acquiredServers.delete(server);
+}
 
 beforeEach(() => {
+  if (globalThis.fetch !== initialFetch) throw new Error("SETUP: fetch must be restored before native-profile drain cases");
   opencodexHome = mkdtempSync(join(tmpdir(), "ocx-main-drain-server-"));
   codexHome = mkdtempSync(join(tmpdir(), "ocx-main-drain-codex-"));
   process.env.OPENCODEX_HOME = opencodexHome;
   process.env.CODEX_HOME = codexHome;
   writeFileSync(
     join(codexHome, "auth.json"),
-    JSON.stringify({ tokens: { access_token: "main-access", account_id: "main-account" } }),
+    JSON.stringify({ tokens: { access_token: "main-access", refresh_token: "main-refresh", account_id: "main-account" } }),
   );
   clearAccountQuota();
   clearThreadAccountMap();
@@ -51,8 +65,17 @@ beforeEach(() => {
   resetLifecycleDrainStateForTests();
 });
 
-afterEach(() => {
-  globalThis.fetch = originalFetch;
+afterEach(async () => {
+  let stopFailure: unknown;
+  for (const server of [...acquiredServers]) {
+    try {
+      await server.stop(true);
+    } catch (error) {
+      stopFailure ??= error;
+    }
+  }
+  acquiredServers.clear();
+  if (globalThis.fetch !== initialFetch) globalThis.fetch = initialFetch;
   resetLifecycleDrainStateForTests();
   clearAccountQuota();
   clearThreadAccountMap();
@@ -64,12 +87,14 @@ afterEach(() => {
   else process.env.OPENCODEX_HOME = previousOpencodexHome;
   if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
   else process.env.CODEX_HOME = previousCodexHome;
+  if (stopFailure) throw stopFailure;
 });
 
 describe("native main profile scoped server admission", () => {
   test("HTTP and Responses WebSocket keep Direct live while main Pool frames are rejected", async () => {
     let upstreamRequests = 0;
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const originalFetch = globalThis.fetch;
+    const upstreamFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
       if (url.includes("chatgpt.com/backend-api/codex/responses")) {
         upstreamRequests += 1;
@@ -91,6 +116,7 @@ describe("native main profile scoped server admission", () => {
           baseUrl: "https://chatgpt.com/backend-api/codex",
           authMode: "forward",
           codexAccountMode,
+          upstreamWebsocket: false,
         },
       },
       codexAccounts: [],
@@ -98,7 +124,7 @@ describe("native main profile scoped server admission", () => {
       autoSwitchThreshold: 0,
     } as OcxConfig);
     const waitForFrame = (ws: WebSocket, needle: string) => new Promise<string>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`websocket timeout waiting for ${needle}`)), watchdogMs(2_000));
+      const timer = setTimeout(() => reject(new Error(`websocket timeout waiting for ${needle}; upstream requests=${upstreamRequests}`)), watchdogMs(2_000));
       const onMessage = (event: MessageEvent) => {
         const text = typeof event.data === "string" ? event.data : "";
         if (!text.includes(needle)) return;
@@ -109,11 +135,14 @@ describe("native main profile scoped server admission", () => {
       ws.addEventListener("message", onMessage);
     });
 
-    saveMode("direct");
-    let server: ReturnType<typeof startServer> | undefined = startServer(0, { inspectNativeCodexOwnership });
-    const drain = acquireNativeMainProfileDrain("test-switch");
-    expect(drain).not.toBeNull();
+    let server: ReturnType<typeof startServer> | undefined;
+    let drain: ReturnType<typeof acquireNativeMainProfileDrain> | null = null;
     try {
+      globalThis.fetch = upstreamFetch;
+      saveMode("direct");
+      server = trackServer(startServer(0, { inspectNativeCodexOwnership }));
+      drain = acquireNativeMainProfileDrain("test-switch");
+      expect(drain).not.toBeNull();
       const directHttp = await fetch(new URL("/v1/responses", server.url), {
         method: "POST",
         headers: { "content-type": "application/json", authorization: "Bearer caller-token" },
@@ -133,12 +162,12 @@ describe("native main profile scoped server admission", () => {
       directWs.send(JSON.stringify({ type: "response.create", model: "gpt-test", input: "hello" }));
       await directTerminal;
       directWs.close();
-      await server.stop(true);
+      await stopTrackedServer(server);
       server = undefined;
 
       saveMode("pool");
       updateAccountQuota(MAIN_CODEX_ACCOUNT_ID, 1, 1);
-      server = startServer(0, { inspectNativeCodexOwnership });
+      server = trackServer(startServer(0, { inspectNativeCodexOwnership }));
       await waitForNativeMainStartupGate();
       const mainHttp = await fetch(new URL("/v1/responses", server.url), {
         method: "POST",
@@ -163,14 +192,15 @@ describe("native main profile scoped server admission", () => {
       expect(upstreamRequests).toBe(2);
     } finally {
       drain?.release();
-      await server?.stop(true);
+      if (server) await stopTrackedServer(server);
+      if (globalThis.fetch === upstreamFetch) globalThis.fetch = originalFetch;
     }
   });
 
   test("Live/Realtime sideband retains main ownership while Direct and non-main Pool continue", async () => {
     let upstreamConnections = 0;
     let upstreamCloses = 0;
-    const upstream = Bun.serve({
+    const upstream = trackServer(Bun.serve({
       port: 0,
       fetch(req, server) {
         if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
@@ -184,7 +214,7 @@ describe("native main profile scoped server admission", () => {
         message(ws, message) { ws.send(`echo:${String(message)}`); },
         close() { upstreamCloses += 1; },
       },
-    });
+    }));
     const waitUntil = async (condition: () => boolean): Promise<void> => {
       const deadline = Date.now() + 2_000;
       while (!condition() && Date.now() < deadline) await Bun.sleep(10);
@@ -194,6 +224,7 @@ describe("native main profile scoped server admission", () => {
       baseUrl: "https://chatgpt.com/backend-api/codex",
       authMode: "forward" as const,
       codexAccountMode,
+      upstreamWebsocket: false,
     });
     const saveMode = (codexAccountMode: "direct" | "pool", activeCodexAccountId: string) => saveConfig({
       port: 0,
@@ -280,7 +311,7 @@ describe("native main profile scoped server admission", () => {
     try {
       saveMode("pool", MAIN_CODEX_ACCOUNT_ID);
       updateAccountQuota(MAIN_CODEX_ACCOUNT_ID, 1, 1);
-      server = startServer(0, { inspectNativeCodexOwnership });
+      server = trackServer(startServer(0, { inspectNativeCodexOwnership }));
       await waitForNativeMainStartupGate();
       client = await connectEcho(server, "/v1/live/main-pre-fence");
       expect(getNativeMainProfileRequestCount()).toBe(1);
@@ -313,11 +344,11 @@ describe("native main profile scoped server admission", () => {
       expect(await handshakeStatus(server, "/v1/realtime?call_id=main-post-fence")).toBe(503);
       expect(upstreamConnections).toBe(1);
       mainDrain?.release();
-      await server.stop(true);
+      await stopTrackedServer(server);
       server = undefined;
 
       saveMode("direct", MAIN_CODEX_ACCOUNT_ID);
-      server = startServer(0, { inspectNativeCodexOwnership });
+      server = trackServer(startServer(0, { inspectNativeCodexOwnership }));
       const directDrain = acquireNativeMainProfileDrain("direct-sideband");
       const directToken = fakeChatGptJwt({ chatgpt_account_id: "direct-account" });
       client = await connectEcho(server, "/v1/live/direct", {
@@ -328,7 +359,7 @@ describe("native main profile scoped server admission", () => {
       directDrain?.release();
       await closeSocket(client);
       client = undefined;
-      await server.stop(true);
+      await stopTrackedServer(server);
       server = undefined;
 
       saveCodexAccountCredential("pool-a", {
@@ -339,7 +370,7 @@ describe("native main profile scoped server admission", () => {
       });
       updateAccountQuota("pool-a", 1, 1);
       saveMode("pool", "pool-a");
-      server = startServer(0, { inspectNativeCodexOwnership });
+      server = trackServer(startServer(0, { inspectNativeCodexOwnership }));
       const poolDrain = acquireNativeMainProfileDrain("pool-sideband");
       client = await connectEcho(server, "/v1/realtime/calls/pool");
       expect(getNativeMainProfileRequestCount()).toBe(0);
@@ -349,8 +380,8 @@ describe("native main profile scoped server admission", () => {
       expect(upstreamConnections).toBe(3);
     } finally {
       if (client) await closeSocket(client).catch(() => {});
-      await server?.stop(true);
-      await upstream.stop(true);
+      if (server) await stopTrackedServer(server);
+      await stopTrackedServer(upstream);
     }
   });
 
@@ -404,14 +435,14 @@ describe("native main profile scoped server admission", () => {
         return { ok: true };
       },
     } as unknown as NativeProfileManager;
-    const server = startServer(0, {
+    const server = trackServer(startServer(0, {
       inspectNativeCodexOwnership,
       liveSidebandWebSocketFactory: () => {
         upstream = new UncooperativeUpstream();
         queueMicrotask(() => upstream?.open());
         return upstream as unknown as WebSocket;
       },
-    });
+    }));
     await waitForNativeMainStartupGate();
     const url = new URL("/v1/live/uncooperative", server.url);
     url.protocol = "ws:";
@@ -462,7 +493,7 @@ describe("native main profile scoped server admission", () => {
       expect(getNativeMainProfileRequestCount()).toBe(0);
     } finally {
       upstream?.finishClose();
-      await server.stop(true);
+      await stopTrackedServer(server);
     }
   });
 });

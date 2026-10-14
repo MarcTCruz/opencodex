@@ -27,6 +27,7 @@ Persisted config, the Codex home it writes into, and the model catalog it publis
 | [`config.md`](config.md) | Persisted config schema, both injection forms, provider validation, and restore. |
 | [`codex-provider-routing.md`](codex-provider-routing.md) | Explicit provider-ID routing consent, URL-only publication and recovery. |
 | [`codex-home.md`](codex-home.md) | CODEX_HOME resolution, the files opencodex manages there, and Codex-home diagnostics. |
+| [`native-main-credentials.md`](native-main-credentials.md) | In-memory native-main auth observation, publication, and confirmed deletion. |
 | [`codex-prompts.md`](codex-prompts.md) | Prompt-layer repair, base import previews and bounded text-probe sources. |
 | [`codex-cli-update.md`](codex-cli-update.md) | Read-only update planning, isolated npm environment, and complete process observation. |
 | [`catalog.md`](catalog.md) | Shared Codex catalog assembly, account namespaces, pool rotation, and effort ladders. |
@@ -179,7 +180,7 @@ A source area can be described by more than one doc, because these docs are orga
 | `src/cli/models-runtime.ts` | [`pricing.md`](pricing.md) |
 | `src/client/` | [`runtime.md`](runtime.md)<br>[`clients/claude-desktop.md`](clients/claude-desktop.md) |
 | `src/clients/` | [`clients/integrations.md`](clients/integrations.md)<br>[`clients/qoder.md`](clients/qoder.md) |
-| `src/codex/` | [`runtime.md`](runtime.md)<br>[`config.md`](config.md)<br>[`codex-home.md`](codex-home.md)<br>[`codex-prompts.md`](codex-prompts.md)<br>[`catalog.md`](catalog.md)<br>[`subagents.md`](subagents.md)<br>[`subagent-capacity.md`](subagent-capacity.md)<br>[`transports/responses-failover.md`](transports/responses-failover.md)<br>[`providers/openai-tiers.md`](providers/openai-tiers.md)<br>[`providers/openai-accounts.md`](providers/openai-accounts.md)<br>[`gui-and-management-api.md`](gui-and-management-api.md)<br>[`dashboard-and-usage.md`](dashboard-and-usage.md)<br>[`clients/codex-desktop.md`](clients/codex-desktop.md)<br>[`clients/chatgpt-desktop.md`](clients/chatgpt-desktop.md)<br>[`ops/docs-and-release.md`](ops/docs-and-release.md) |
+| `src/codex/` | [`runtime.md`](runtime.md)<br>[`config.md`](config.md)<br>[`codex-home.md`](codex-home.md)<br>[`native-main-credentials.md`](native-main-credentials.md)<br>[`codex-prompts.md`](codex-prompts.md)<br>[`catalog.md`](catalog.md)<br>[`subagents.md`](subagents.md)<br>[`subagent-capacity.md`](subagent-capacity.md)<br>[`transports/responses-failover.md`](transports/responses-failover.md)<br>[`providers/openai-tiers.md`](providers/openai-tiers.md)<br>[`providers/openai-accounts.md`](providers/openai-accounts.md)<br>[`gui-and-management-api.md`](gui-and-management-api.md)<br>[`dashboard-and-usage.md`](dashboard-and-usage.md)<br>[`clients/codex-desktop.md`](clients/codex-desktop.md)<br>[`clients/chatgpt-desktop.md`](clients/chatgpt-desktop.md)<br>[`ops/docs-and-release.md`](ops/docs-and-release.md) |
 | `src/codex/account-pause.ts` | [`account-auto-pause.md`](account-auto-pause.md) |
 | `src/codex/account-preservation.ts` | [`providers/openai-signed-in-preservation.md`](providers/openai-signed-in-preservation.md) |
 | `src/codex/app-server-processes.ts` | [`codex-cli-update.md`](codex-cli-update.md) |

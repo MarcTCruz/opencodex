@@ -435,7 +435,7 @@ describe("main policy quota durability and lifecycle", () => {
 
   test("owned reconciliation publishes identity and confirmed transitions purge policy and equality", () => {
     writeFileSync(join(testDir, "auth.json"), JSON.stringify({ tokens: {
-      access_token: "fixture-bearer-a", account_id: "fixture-main-a",
+      access_token: "fixture-bearer-a", refresh_token: "fixture-refresh-a", account_id: "fixture-main-a",
     } }));
     expect(reconcileMainCodexAccountRuntimeState()).toBe(false);
     const writer = observeMainQuotaCredential("fixture-bearer-a", "fixture-main-a");

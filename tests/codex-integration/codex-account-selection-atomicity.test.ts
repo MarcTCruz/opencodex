@@ -66,7 +66,7 @@ beforeEach(() => {
   mkdirSync(process.env.CODEX_HOME);
   clearState();
   writeFileSync(join(process.env.CODEX_HOME, "auth.json"), JSON.stringify({
-    tokens: { access_token: credential(MAIN).accessToken, account_id: credential(MAIN).chatgptAccountId },
+    tokens: { access_token: credential(MAIN).accessToken, refresh_token: credential(MAIN).refreshToken, account_id: credential(MAIN).chatgptAccountId },
   }));
   writeFileSync(join(process.env.OPENCODEX_HOME, "codex-accounts.json"), JSON.stringify({
     [ACCOUNT_A]: credential(ACCOUNT_A), [ACCOUNT_B]: credential(ACCOUNT_B),

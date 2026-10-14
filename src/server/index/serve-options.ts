@@ -1499,7 +1499,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
           addFinalRequestLog(requestId, start, logCtx, status, meta);
         };
         const sessionReq = withCallerSessionIdentity(withGrokSessionIdentity(req), admission);
-        return runAdmittedHttpTurn(sessionReq, policy, async turnAdmissionLease => {
+        const admittedResponse = await runAdmittedHttpTurn(sessionReq, policy, async turnAdmissionLease => {
           let response: Response;
           try {
             response = await handleResponses(sessionReq, config, logCtx, {
@@ -1533,6 +1533,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
             requestId,
           );
         }, { requestId, start, logCtx });
+        return admittedResponse;
       }
 
       // Anthropic Messages inbound (Claude Code). count_tokens FIRST (longer path).

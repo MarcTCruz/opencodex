@@ -57,6 +57,16 @@ const { handleResponses } = await import("../../src/server/responses/core");
 const { loadConfig, saveConfig } = await import("../../src/config");
 
 let config = loadConfig();
+if (config.providers.openai?.adapter === "openai-responses" && config.providers.openai.authMode === "forward") {
+  config = {
+    ...config,
+    providers: {
+      ...config.providers,
+      openai: { ...config.providers.openai, upstreamWebsocket: false },
+    },
+  };
+  saveConfig(config);
+}
 const observe = () => ({
   matched: matchesMainQuotaCredential(fixture.bearer, fixture.accountId),
   policy: getMainPolicyQuota(),
@@ -275,7 +285,9 @@ try {
   const originalResponse = ["recovery", "renewed-listener", "manual-recovery", "stale-sweep"].includes(fixture.scenario)
     ? await wire(fixture.originalBearer, fixture.originalAccountId) : undefined;
   if (fixture.scenario === "retained-unknown-binding") {
-    writeFileSync(manager.context.authPath, JSON.stringify({ tokens: { access_token: otherBearer, account_id: otherAccountId } }));
+    writeFileSync(manager.context.authPath, JSON.stringify({ tokens: {
+      access_token: otherBearer, refresh_token: "hard-lock-other-refresh", account_id: otherAccountId,
+    } }));
     servers.push(start());
     await waitForNativeMainStartupGate();
     validReplacement = { oldMatched: matchesMainQuotaCredential(fixture.bearer, fixture.accountId),

@@ -634,6 +634,7 @@ describe("native GPT model toggles (bare slugs in disabledModels)", () => {
     const canonical = {
       adapter: "openai-responses",
       baseUrl: "https://chatgpt.com/backend-api/codex",
+      upstreamWebsocket: false,
     } as const;
     expect(shouldIncludeNativeOpenAi({ providers: {} })).toBe(true);
     expect(shouldIncludeNativeOpenAi({ providers: { openai: canonical } })).toBe(true);
@@ -794,7 +795,7 @@ describe("native GPT model toggles (bare slugs in disabledModels)", () => {
 
       // A confirmed roster makes the gated rows selectable again; a bare disable still wins.
       writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
-        tokens: { access_token: "toggle-token", account_id: "toggle-main" },
+        tokens: { access_token: "toggle-token", refresh_token: "toggle-refresh", account_id: "toggle-main" },
       }));
       seedCodexModelEntitlementsForTests(
         "main",
@@ -839,7 +840,7 @@ describe("native GPT model toggles (bare slugs in disabledModels)", () => {
     process.env.OPENCODEX_HOME = join(root, "opencodex");
     process.env.CODEX_HOME = codexHome;
     writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
-      tokens: { access_token: "expired-token", account_id: "expired-main" },
+      tokens: { access_token: "expired-token", refresh_token: "expired-refresh", account_id: "expired-main" },
     }));
     seedCodexModelEntitlementsForTests(
       "main",

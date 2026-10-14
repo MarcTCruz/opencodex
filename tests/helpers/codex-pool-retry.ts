@@ -18,10 +18,11 @@ export function createPoolRetryHarness(context: {
   testDir: string;
   originalFetch: typeof fetch;
   redirectCanonicalCodexTo: (baseUrl: string) => void;
+  trackServer: (server: ReturnType<typeof startServer> | ReturnType<typeof Bun.serve>) => void;
   canonicalDirect: OcxProviderConfig;
 }) {
   const { testDir: TEST_DIR, originalFetch: originalGlobalFetch,
-    redirectCanonicalCodexTo, canonicalDirect } = context;
+    redirectCanonicalCodexTo, trackServer, canonicalDirect } = context;
 
   function unsupportedModelBody(model = POOL_RETRY_MODEL): string {
     return JSON.stringify({
@@ -118,6 +119,7 @@ export function createPoolRetryHarness(context: {
         return reply(accountId, request);
       },
     });
+    trackServer(upstream);
     redirectCanonicalCodexTo(upstream.url.toString());
     const redirectedFetch = globalThis.fetch;
 
@@ -129,6 +131,7 @@ export function createPoolRetryHarness(context: {
       providers: {
         openai: {
           ...canonicalDirect,
+          upstreamWebsocket: false,
           codexAccountMode: options.accountMode ?? "pool",
           ...(options.noVisionModels ? { noVisionModels: options.noVisionModels } : {}),
           ...(options.forwardApiKey ? { apiKey: options.forwardApiKey } : {}),
@@ -173,6 +176,7 @@ export function createPoolRetryHarness(context: {
     for (const accountId of options.reauthAccountIds ?? []) markAccountNeedsReauth(accountId);
 
     const server = startServer(0);
+    trackServer(server);
     return {
       config,
       dispatches,
@@ -205,9 +209,9 @@ export function createPoolRetryHarness(context: {
   }
 
   async function stopPoolRetryHarness(harness: PoolRetryHarness): Promise<void> {
-    harness.restoreFetch();
     await harness.server.stop(true);
     await harness.upstream.stop(true);
+    harness.restoreFetch();
   }
 
   function rejectionResponse(body: BodyInit, headers: Record<string, string> = {}): Response {

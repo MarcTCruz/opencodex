@@ -234,14 +234,14 @@ reopened. `ocx status` reports the same drift, also while the loop is gated off,
 It says nothing in a sibling's home, whose routing names the owner beside it, and it promises only
 `ocx sync`, because it cannot see whether a healer runs, is gated, or is paused.
 
-Native-main refresh follows the [rotation contract](providers/openai-accounts.md#native-main-refresh-cancellation).
+The [native-main credential contract](native-main-credentials.md) owns effective `$CODEX_HOME/auth.json` observation, memory, publication, deletion and the filesystem-import guard. Native-main refresh follows the [rotation contract](providers/openai-accounts.md#native-main-refresh-cancellation).
 Same-identity device reauth (#3898) instead obtains a new login grant through
 `/api/codex-auth/main/reauth-device` (start/status/cancel) plus `ocx account main reauth`. It uses the OpenAI deviceauth grant already
 used for pool accounts, but nothing routes through the pool login surface —
 `/api/codex-auth/login` keeps rejecting `__main__` — and the commit is a
 sibling of the refresh write: same-identity check against the snapshot
 captured at start, owner-independent exclusive claim (a headless hub runs no
-owner lifecycle), path/hash/inode re-verification inside the claim, and one
+owner lifecycle), file-identity/digest/observation-generation re-verification inside the claim, and one
 atomic write of access/refresh/id token + account_id. The old identity token
 is never retained beside the new grant. No claim is held while the human
 completes the device page, and no DTO, log, or error carries tokens, emails,

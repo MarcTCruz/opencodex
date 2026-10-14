@@ -80,7 +80,7 @@ describe("declared short-window producer evidence", () => {
       setIcaclsRunnerForTests(() => aclOk);
       setAsyncIcaclsRunnerForTests(async () => aclOk);
       writeFileSync(join(testDir, "auth.json"), JSON.stringify({ tokens: {
-        access_token: "fixture-main-token", account_id: "fixture-main-a",
+        access_token: "fixture-main-token", refresh_token: "fixture-main-refresh", account_id: "fixture-main-a",
       } }));
       let calls = 0;
       let invalid = true;
@@ -165,7 +165,7 @@ describe("declared short-window producer evidence", () => {
         setIcaclsRunnerForTests(() => aclOk);
         setAsyncIcaclsRunnerForTests(async () => aclOk);
         writeFileSync(join(testDir, "auth.json"), JSON.stringify({ tokens: {
-          access_token: "fixture-main-token", account_id: "fixture-main-a",
+          access_token: "fixture-main-token", refresh_token: "fixture-main-refresh", account_id: "fixture-main-a",
         } }));
         const writer = writerFor();
         const enabled = { codexMainAccountHardLock: true };
@@ -229,7 +229,7 @@ describe("declared short-window producer evidence", () => {
     setIcaclsRunnerForTests(() => aclOk);
     setAsyncIcaclsRunnerForTests(async () => aclOk);
     writeFileSync(join(testDir, "auth.json"), JSON.stringify({ tokens: {
-      access_token: "fixture-main-token", account_id: "fixture-main-a",
+      access_token: "fixture-main-token", refresh_token: "fixture-main-refresh", account_id: "fixture-main-a",
     } }));
     let calls = 0;
     globalThis.fetch = Object.assign(async (input: Parameters<typeof fetch>[0]) => {
@@ -262,7 +262,7 @@ describe("declared short-window producer evidence", () => {
       setAsyncIcaclsRunnerForTests(async () => aclOk);
       const accessToken = "test-main";
       writeFileSync(join(testDir, "auth.json"), JSON.stringify({ tokens: {
-        access_token: accessToken, account_id: "fixture-main-a",
+        access_token: accessToken, refresh_token: "fixture-main-refresh", account_id: "fixture-main-a",
       } }));
       let calls = 0;
       const stubFetch: typeof fetch = Object.assign(async (

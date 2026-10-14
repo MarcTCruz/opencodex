@@ -1,9 +1,7 @@
 import { observeMainDecisionCredentialUsable } from "./main-account-cache";
 import { classifyChatgptRefreshFailure, noteChatgptRefreshFailure } from "./chatgpt-refresh-failure";
 import { readBoundedResponseBody } from "../lib/bounded-body";
-import { createHash } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { readCodexTokens } from "./auth-collision";
 import {
   CHATGPT_CLIENT_ID,
@@ -19,7 +17,6 @@ import {
   refreshGrantFingerprintForToken,
   withCodexRefreshFileLock,
 } from "./account-store";
-import { atomicWriteFile, resolveWriteTarget } from "../config/atomic-write";
 import { resolveCodexHomeDir } from "./home";
 import { assertNotRealCodexHomeUnderTest } from "../lib/test-home-guard";
 import {
@@ -38,6 +35,16 @@ import {
   resolveNativeMainRefreshMode,
   type CodexAuthStatus,
 } from "./native-main-refresh-mode";
+import {
+  getNativeMainAuthMemory,
+  NativeMainAuthChangedError,
+  nativeMainAuthFence,
+  nativeMainAuthFenceMatches,
+  observeNativeMainAuthFile,
+  persistRefreshedNativeMainAuthFile,
+  writeNativeMainAuthFileSyncClaimed,
+  type NativeMainAuthWriteFence,
+} from "./native-main-credentials";
 
 export { MAIN_CODEX_ACCOUNT_ID } from "./account-id";
 
@@ -53,15 +60,7 @@ let beforeMainAuthJsonRenameForTests: (() => void) | null = null;
 
 type MainAuthJsonCredential = {
   path: string;
-  rawSha256: string;
-  /**
-   * Filesystem identity of the file the hash was taken from. It catches a writer that
-   * replaces auth.json by rename with identical bytes. It does not see Codex's own writes:
-   * Codex rewrites auth.json in place (truncate + write), which keeps dev and ino, so only
-   * the content hash notices those, and only once the new bytes are visible (#2999).
-   * `null` when the target could not be stat'ed, which fails closed.
-   */
-  identity: { dev: number; ino: number } | null;
+  fence: NativeMainAuthWriteFence;
   root: Record<string, unknown>;
   tokens: Record<string, unknown>;
   accessToken?: string;
@@ -160,34 +159,14 @@ function nonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value : undefined;
 }
 
-function sha256(value: string): string {
-  return createHash("sha256").update(value).digest("hex");
-}
-
-/**
- * Filesystem identity of a path, or null when it cannot be read.
- *
- * Null is deliberately NOT "matches anything": a caller that cannot prove identity must
- * fail closed, because the whole point here is refusing to overwrite a file we can no
- * longer vouch for.
- */
-function statIdentity(path: string): { dev: number; ino: number } | null {
-  try {
-    const stat = statSync(path);
-    return { dev: Number(stat.dev), ino: Number(stat.ino) };
-  } catch {
-    return null;
-  }
-}
-
 function readMainAuthJsonCredential(): MainAuthJsonCredential | null {
-  const path = resolveWriteTarget(join(resolveCodexHomeDir(), "auth.json"));
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf8");
-  } catch {
-    return null;
-  }
+  const path = resolve(join(resolveCodexHomeDir(), "auth.json"));
+  const observed = getNativeMainAuthMemory(path);
+  const snapshot = observed.snapshot;
+  if (observed.status !== "ok" || !snapshot) return null;
+  const raw = snapshot.raw.toString("utf8");
+  const fence = nativeMainAuthFence(snapshot);
+  snapshot.raw.fill(0);
   try {
     const parsed = JSON.parse(raw) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
@@ -204,8 +183,7 @@ function readMainAuthJsonCredential(): MainAuthJsonCredential | null {
       ?? "";
     return {
       path,
-      rawSha256: sha256(raw),
-      identity: statIdentity(path),
+      fence,
       root,
       tokens,
       ...(accessToken ? { accessToken } : {}),
@@ -214,6 +192,8 @@ function readMainAuthJsonCredential(): MainAuthJsonCredential | null {
     };
   } catch {
     return null;
+  } finally {
+    observed.raw?.fill(0);
   }
 }
 
@@ -269,30 +249,21 @@ export function hasMainAccountRefreshGrant(): boolean {
 }
 
 function assertMainAuthJsonSnapshotUnchanged(expected: MainAuthJsonCredential): void {
-  const current = readMainAuthJsonCredential();
-  if (!current || current.path !== expected.path || current.rawSha256 !== expected.rawSha256) {
-    throw new MainAuthJsonChangedDuringRefreshError();
-  }
-  // Also refuse a rename-based replacement with identical bytes. An unreadable identity on
-  // either side fails closed. This narrows the window; rename(2) still replaces
-  // unconditionally after this check returns.
-  assertMainAuthJsonIdentityUnchanged(expected);
-}
-
-function assertMainAuthJsonIdentityUnchanged(expected: MainAuthJsonCredential): void {
-  const identity = statIdentity(expected.path);
-  if (!identity
-    || !expected.identity
-    || identity.dev !== expected.identity.dev
-    || identity.ino !== expected.identity.ino) {
-    throw new MainAuthJsonChangedDuringRefreshError();
+  const observed = observeNativeMainAuthFile(expected.path);
+  try {
+    if (!observed.canRefreshOrWrite || !nativeMainAuthFenceMatches(observed.snapshot, expected.fence)) {
+      throw new MainAuthJsonChangedDuringRefreshError();
+    }
+  } finally {
+    observed.raw?.fill(0);
+    observed.snapshot?.raw.fill(0);
   }
 }
 
-function persistRefreshedMainAuthJson(
+async function persistRefreshedMainAuthJson(
   expected: MainAuthJsonCredential,
   refreshed: OAuthCredentials,
-): { accessToken: string; chatgptAccountId: string } {
+): Promise<{ accessToken: string; chatgptAccountId: string } | null> {
   assertNotRealCodexHomeUnderTest(resolveCodexHomeDir());
   const accessToken = refreshed.access;
   const refreshToken = refreshed.refresh || expected.refreshToken!;
@@ -303,29 +274,35 @@ function persistRefreshedMainAuthJson(
     refresh_token: refreshToken,
     account_id: chatgptAccountId,
   };
-  atomicWriteFile(
+  const outcome = await persistRefreshedNativeMainAuthFile(
     expected.path,
     JSON.stringify({ ...expected.root, tokens }, null, 2) + "\n",
-    undefined,
     {
-      beforeRename: () => {
-        assertMainAuthJsonSnapshotUnchanged(expected);
-        const hook = beforeMainAuthJsonRenameForTests;
-        beforeMainAuthJsonRenameForTests = null;
-        hook?.();
-      },
-      // Runs immediately before rename(2), after the test hook has had its chance to
-      // simulate an external writer. Full snapshot check (content AND identity): this is
-      // the last look we get, so it asks everything it can rather than the cheap question.
-      validateBeforeRename: () => assertMainAuthJsonSnapshotUnchanged(expected),
+      expectedSnapshot: expected.fence,
+      beforeRename: consumeMainAuthJsonBeforeRenameHook(),
     },
   );
+  if (outcome.status === "deleted") return null;
+  if (outcome.status === "stopped") return null;
+  if (outcome.status === "recovery-required" || outcome.status === "superseded") {
+    outcome.snapshot?.raw.fill(0);
+    throw new MainAuthJsonChangedDuringRefreshError();
+  }
   advanceCodexCredentialMutationEpoch();
-  return { accessToken, chatgptAccountId };
+  const current = readMainAuthJsonCredential();
+  return current?.accessToken
+    ? { accessToken: current.accessToken, chatgptAccountId: current.chatgptAccountId }
+    : null;
 }
 
 export function setMainAuthJsonBeforeRenameHookForTests(hook: (() => void) | null): void {
   beforeMainAuthJsonRenameForTests = hook;
+}
+
+function consumeMainAuthJsonBeforeRenameHook(): (() => void) | undefined {
+  const hook = beforeMainAuthJsonRenameForTests;
+  beforeMainAuthJsonRenameForTests = null;
+  return hook ?? undefined;
 }
 
 /** Complete token set a native device reauth commits into the main slot (#3898). */
@@ -370,20 +347,21 @@ function persistNativeMainReauthTokens(
     id_token: tokens.idToken,
     account_id: tokens.chatgptAccountId,
   };
-  atomicWriteFile(
-    expected.path,
-    JSON.stringify({ ...expected.root, tokens: nextTokens }, null, 2) + "\n",
-    undefined,
-    {
-      beforeRename: () => {
-        assertMainAuthJsonSnapshotUnchanged(expected);
-        const hook = beforeMainAuthJsonRenameForTests;
-        beforeMainAuthJsonRenameForTests = null;
-        hook?.();
+  try {
+    writeNativeMainAuthFileSyncClaimed(
+      expected.path,
+      JSON.stringify({ ...expected.root, tokens: nextTokens }, null, 2) + "\n",
+      {
+        expectedSnapshot: expected.fence,
+        beforeRename: consumeMainAuthJsonBeforeRenameHook(),
       },
-      validateBeforeRename: () => assertMainAuthJsonSnapshotUnchanged(expected),
-    },
-  );
+    );
+  } catch (error) {
+    if (error instanceof NativeMainAuthChangedError) {
+      throw new MainAuthJsonChangedDuringRefreshError();
+    }
+    throw error;
+  }
   advanceCodexCredentialMutationEpoch();
 }
 
@@ -506,7 +484,18 @@ async function resolveMainAccountToken(
     return await withNativeMainExclusiveClaim(
       resolveNativeProfileContext(),
       () => withCodexRefreshFileLock(lockKey, signal, async () => {
+        const observation = observeNativeMainAuthFile(join(resolveCodexHomeDir(), "auth.json"));
         const locked = readMainAuthJsonCredential();
+        if (!observation.canRefreshOrWrite) {
+          observation.raw?.fill(0);
+          observation.snapshot?.raw.fill(0);
+          if (locked?.accessToken && locked.accessToken !== rejectedAccessToken) {
+            return { accessToken: locked.accessToken, chatgptAccountId: locked.chatgptAccountId };
+          }
+          return null;
+        }
+        observation.raw?.fill(0);
+        observation.snapshot?.raw.fill(0);
         if (!locked) throw new MainAuthJsonChangedDuringRefreshError();
         if (credentialRefreshGrantRejected(locked)) throw new MainAccountTokenRefreshError("reauth");
         if (!locked.refreshToken
@@ -529,8 +518,34 @@ async function resolveMainAccountToken(
         const refresh = dependencies.refreshToken ?? refreshNativeMainGrant;
         let refreshed: OAuthCredentials;
         if (signal.aborted) throw signal.reason;
+        const beforeRefreshObservation = observeNativeMainAuthFile(locked.path);
+        const beforeRefresh = readMainAuthJsonCredential();
+        if (!beforeRefreshObservation.canRefreshOrWrite
+          || !beforeRefresh
+          || !nativeMainAuthFenceMatches(beforeRefreshObservation.snapshot, locked.fence)
+          || !nativeMainAuthFenceMatches(beforeRefreshObservation.snapshot, beforeRefresh.fence)
+          || beforeRefresh.fence.digest !== locked.fence.digest
+          || beforeRefresh.fence.identity.dev !== locked.fence.identity.dev
+          || beforeRefresh.fence.identity.ino !== locked.fence.identity.ino
+          || beforeRefresh.fence.observationGeneration !== locked.fence.observationGeneration
+          || !beforeRefresh.refreshToken
+          || refreshGrantFingerprintForToken(beforeRefresh.refreshToken) !== lockKey) {
+          beforeRefreshObservation.raw?.fill(0);
+          beforeRefreshObservation.snapshot?.raw.fill(0);
+          if (beforeRefresh?.accessToken
+            && beforeRefresh.accessToken !== rejectedAccessToken
+            && mainAccessTokenFresh(beforeRefresh.accessToken, Date.now(), 0)) {
+            return {
+              accessToken: beforeRefresh.accessToken,
+              chatgptAccountId: beforeRefresh.chatgptAccountId,
+            };
+          }
+          throw new MainAuthJsonChangedDuringRefreshError();
+        }
+        beforeRefreshObservation.raw?.fill(0);
+        beforeRefreshObservation.snapshot?.raw.fill(0);
         try {
-          refreshed = await refresh(locked.refreshToken, { signal: refreshTimeout });
+          refreshed = await refresh(beforeRefresh.refreshToken, { signal: refreshTimeout });
         } catch (cause) {
           // A refusal already classified at the endpoint keeps that verdict. An injected refresh
           // threw an ordinary Error and has only its message, so prose still decides there --
@@ -549,7 +564,7 @@ async function resolveMainAccountToken(
           // revoked session stayed `needsReauth: false` and every request re-earned its own 401.
           if (signal.aborted) throw signal.reason;
           if (reason === "reauth") {
-            assertMainAuthJsonSnapshotUnchanged(locked);
+            assertMainAuthJsonSnapshotUnchanged(beforeRefresh);
             markMainRefreshGrantRejected(mainRefreshGrantKey(locked)!); observeMainDecisionCredentialUsable(false);
           }
           throw new MainAccountTokenRefreshError(reason, { cause });
@@ -557,19 +572,20 @@ async function resolveMainAccountToken(
         // Once the exchange starts, only its own timeout may abort it: a successful
         // rotating grant retires the old refresh token. Save the only live grant before
         // honoring caller cancellation, while retaining the external-writer guards.
-        let result: { accessToken: string; chatgptAccountId: string };
+        let result: { accessToken: string; chatgptAccountId: string } | null;
         try {
-          result = persistRefreshedMainAuthJson(locked, refreshed);
+          result = await persistRefreshedMainAuthJson(beforeRefresh, refreshed);
         } catch (cause) {
           if (!(cause instanceof MainAuthJsonChangedDuringRefreshError)) throw cause;
           // Another writer owns auth.json now (#2999). The exchange already succeeded, so
           // failing the request would waste it. Serve the new access token to this request
-          // only: leave the file as the other writer left it, keep nothing as the main
-          // credential, and do not retire the grant.
+          // only; the store keeps memory aligned with its file observation and does not
+          // mark the old grant rejected.
           noteNativeMainRefresh("publish-refused-served-in-flight");
           if (dependencies.signal?.aborted) throw dependencies.signal.reason;
-          return inFlightMainAccountToken(locked, refreshed);
+          return inFlightMainAccountToken(beforeRefresh, refreshed);
         }
+        if (!result) return null;
         // A permitted in-flight success speaks only for its own profile and grant.
         clearMainRefreshGrantRejection(mainRefreshGrantKey(locked)!);
         if (dependencies.preserveReauth !== true) clearAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
@@ -586,7 +602,7 @@ async function resolveMainAccountToken(
   }
 }
 
-/** The refreshed bearer for one request whose save was refused; never stored anywhere. */
+/** Refreshed bearer for a request whose result the store did not publish to auth.json. */
 function inFlightMainAccountToken(
   expected: MainAuthJsonCredential,
   refreshed: OAuthCredentials,

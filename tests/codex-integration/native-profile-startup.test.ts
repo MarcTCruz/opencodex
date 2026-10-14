@@ -20,6 +20,7 @@ import {
   readNativeEnvelope,
   readNativeProfileVault,
   inspectNativeProfileJournal,
+  resolveNativeProfileContext,
   serializeNativeProfileJournal,
 } from "../../src/codex/native-profile-store";
 import type {
@@ -506,12 +507,20 @@ describe("native-main startup journal gate", () => {
   test("journal recovery opens only after the post-recovery probe reaches none", async () => {
     const states = ["journal", "none"] as const;
     let recoverCalls = 0;
-    const homeId = "home-journal-recovered";
+    const root = mkdtempSync(join(tmpdir(), "ocx-startup-journal-recovered-"));
+    roots.push(root);
+    const codexHome = join(root, "codex");
+    const configDir = join(root, "opencodex");
+    mkdirSync(codexHome, { recursive: true });
+    mkdirSync(configDir, { recursive: true });
+    const context = resolveNativeProfileContext({ codexHome, configDir });
+    const homeId = context.homeId;
+    const manager = {
+      context,
+      recover: async () => { recoverCalls += 1; return { recovered: true }; },
+    } as unknown as NativeProfileManager;
     const gate = await initializeNativeMainStartupGate({
-      manager: {
-        context: { homeId },
-        recover: async () => { recoverCalls += 1; return { recovered: true }; },
-      } as unknown as NativeProfileManager,
+      manager,
       probeRecoveryState: () => states.shift() ?? "none",
     });
     expect(gate).toEqual({ status: "ready", homeId });

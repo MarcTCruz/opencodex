@@ -51,7 +51,7 @@ beforeEach(() => {
   setMainAccountPlan(null);
   resetMainCodexAccountIdentityTrackingForTests();
   writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
-    tokens: { access_token: jwtWithExp(Math.floor(Date.now() / 1000) + 3600), account_id: "acct-main" },
+    tokens: { access_token: jwtWithExp(Math.floor(Date.now() / 1000) + 3600), refresh_token: "fixture-main-refresh", account_id: "acct-main" },
   }));
 });
 
@@ -155,7 +155,7 @@ test.each([
   { status: 403, live: true, code: "permission_denied", reason: "refresh_failed" },
 ])("reauth attribution follows terminal probe evidence: %j", async ({ status, live, code, reason }) => {
   writeFileSync(join(process.env.CODEX_HOME!, "auth.json"), JSON.stringify({
-    tokens: { access_token: jwtWithExp(Math.floor(Date.now() / 1000) + (live ? 3600 : -60)), account_id: "acct-main" },
+    tokens: { access_token: jwtWithExp(Math.floor(Date.now() / 1000) + (live ? 3600 : -60)), refresh_token: "fixture-main-refresh", account_id: "acct-main" },
   }));
   markAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
   globalThis.fetch = (async () => Response.json({ error: { code } }, { status })) as typeof fetch;

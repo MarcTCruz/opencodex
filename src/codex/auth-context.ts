@@ -121,7 +121,7 @@ function requestOwnedMainPinHasQuotaHeadroom(config: OcxConfig): boolean {
  * Exported for exactly one reason: two copies of this fence is how #4850 happened. Final
  * authentication honoured the ownership boundary while request preview, computing its fence from
  * recovery and drain state alone, still handed pool eligibility the default liveness probe and
- * opened the physical `auth.json` twice per spawn. A predicate one caller can forget is a
+ * read the native-main credential twice per spawn. A predicate one caller can forget is a
  * predicate the other caller will eventually disagree with.
  *
  * Read-free by construction, which is what makes it usable on the fenced side. Every input is
@@ -1599,7 +1599,7 @@ async function resolveCodexAuthContextUnannotated(
   }
 
   if (accountId === MAIN_CODEX_ACCOUNT_ID) {
-    // Main account in rotation: refresh auth.json before upstream I/O and fail closed if it vanished.
+    // Main account in rotation: refresh the memory-backed native credential before upstream I/O.
     let token: { accessToken: string; chatgptAccountId: string } | null;
     let mainQuotaWriter = captureObservedMainWriter();
     try {

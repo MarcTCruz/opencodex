@@ -164,6 +164,7 @@ function config(pickerEnabled: boolean, disabledModels: string[] = []): OcxConfi
         adapter: "openai-responses",
         baseUrl: CODEX_FORWARD_BASE_URL,
         authMode: "forward",
+        upstreamWebsocket: false,
       },
     },
     defaultProvider: "openai",
@@ -310,7 +311,7 @@ beforeEach(() => {
   modelRostersByChatgptAccount = new Map();
   modelAccessProgramsByChatgptAccount = new Map();
   writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
-    tokens: { access_token: "main-token", account_id: "main-chatgpt-account" },
+    tokens: { access_token: "main-token", refresh_token: "main-refresh", account_id: "main-chatgpt-account" },
   }));
   saveCodexAccountCredential("side-account-id", {
     accessToken: "side-token",
@@ -472,7 +473,7 @@ test("convergence projects the observed Daybreak row onto its selector and one b
   writeCatalog([nativeEntry()]);
   removeCodexAccountCredential("side-account-id");
   writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
-    tokens: { access_token: "main-token", account_id: "main-chatgpt-account" },
+    tokens: { access_token: "main-token", refresh_token: "main-refresh", account_id: "main-chatgpt-account" },
   }));
   writeFileSync(join(codexHome, "models_cache.json"), JSON.stringify({
     models: [{
@@ -516,7 +517,7 @@ test("convergence projects the observed Daybreak row onto its selector and one b
 test("Direct convergence does not borrow a Pool-only Daybreak grant for the bare row", async () => {
   writeCatalog([nativeEntry()]);
   writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
-    tokens: { access_token: "main-token", account_id: "main-chatgpt-account" },
+    tokens: { access_token: "main-token", refresh_token: "main-refresh", account_id: "main-chatgpt-account" },
   }));
   saveCodexAccountCredential("side-account-id", {
     accessToken: "side-token",

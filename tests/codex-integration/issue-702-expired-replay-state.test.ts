@@ -19,6 +19,7 @@ import {
 } from "../../src/responses/state";
 import { responseSpillDirectory } from "../../src/responses/spill-store";
 import { startServer } from "../../src/server";
+import { spendLedgerOwnerSnapshot } from "../../src/lib/spend-ledger-owner";
 import type { OcxConfig } from "../../src/types";
 import { fakeChatGptJwt } from "../helpers/fake-chatgpt-jwt";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "../helpers/isolated-codex-home";
@@ -26,8 +27,12 @@ import { INTERNAL_DEADLINE_MS, SERVER_BUDGET_MS } from "../helpers/test-budget";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 
 const originalFetch = globalThis.fetch;
+const originalDateNow = Date.now;
 const previousOpencodexHome = process.env.OPENCODEX_HOME;
 const previousApiToken = process.env.OPENCODEX_API_AUTH_TOKEN;
+type CaseServer = ReturnType<typeof startServer> | ReturnType<typeof Bun.serve>;
+const caseServers: CaseServer[] = [];
+const caseServerStops = new WeakMap<CaseServer, Promise<void>>();
 const REPLAY_TTL_MS = RESPONSE_TTL_MS;
 const EXPIRED_AGE_MS = REPLAY_TTL_MS + 60 * 60 * 1_000;
 const FIRST_RESPONSE_ID = "resp_issue_702_first";
@@ -78,9 +83,36 @@ function forwardConfig(): OcxConfig {
         baseUrl: "https://chatgpt.com/backend-api/codex",
         authMode: "forward",
         codexAccountMode: "direct",
+        upstreamWebsocket: false,
       },
     },
   } as OcxConfig;
+}
+
+function trackCaseServer<T extends CaseServer>(server: T): T {
+  caseServers.push(server);
+  return server;
+}
+
+function stopCaseServer(server: CaseServer | null | undefined): Promise<void> {
+  if (!server) return Promise.resolve();
+  const existing = caseServerStops.get(server);
+  if (existing) return existing;
+  const stopping = Promise.resolve().then(() => server.stop(true));
+  caseServerStops.set(server, stopping);
+  return stopping;
+}
+
+async function stopCaseServers(): Promise<void> {
+  let stopError: unknown;
+  for (const server of caseServers.splice(0).reverse()) {
+    try {
+      await stopCaseServer(server);
+    } catch (error) {
+      stopError ??= error;
+    }
+  }
+  if (stopError) throw stopError;
 }
 
 function inputMessage(text: string): Record<string, unknown> {
@@ -178,35 +210,46 @@ async function runForwardScenario(
   let server: ReturnType<typeof startServer> | null = null;
 
   try {
-    upstream = Bun.serve({
-      port: 0,
-      async fetch(request) {
-        const path = new URL(request.url).pathname;
-        const body = await request.json() as Record<string, unknown>;
-        upstreamRequests.push({ path, body });
-        const attempt = upstreamRequests.length;
-        const responseId = attempt === 1 ? FIRST_RESPONSE_ID : "resp_issue_702_resumed";
-        const text = attempt === 1 ? HISTORICAL_ASSISTANT_SENTINEL : "resumed without prior context";
-        return new Response(completedSse(responseId, text), {
-          headers: { "content-type": "text/event-stream" },
-        });
-      },
-    });
-    const upstreamUrl = upstream.url;
+    const captureUpstreamRequest = async (request: Request): Promise<Response> => {
+      const path = new URL(request.url).pathname;
+      const body = await request.json() as Record<string, unknown>;
+      upstreamRequests.push({ path, body });
+      const attempt = upstreamRequests.length;
+      const responseId = attempt === 1 ? FIRST_RESPONSE_ID : "resp_issue_702_resumed";
+      const text = attempt === 1 ? HISTORICAL_ASSISTANT_SENTINEL : "resumed without prior context";
+      const response = new Response(completedSse(responseId, text), {
+        headers: { "content-type": "text/event-stream" },
+      });
+      return response;
+    };
+    if (mode !== "ordinary") upstream = trackCaseServer(Bun.serve({ port: 0, fetch: captureUpstreamRequest }));
+    const upstreamUrl = upstream?.url;
 
-    globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const raw = input instanceof Request ? input.url : String(input);
       const url = new URL(raw);
       const prefix = "/backend-api/codex";
       if (url.hostname === "chatgpt.com" && url.pathname.startsWith(prefix)) {
-        const target = new URL(`${url.pathname.slice(prefix.length)}${url.search}`, upstreamUrl);
-        return originalFetch(target, init);
+        const path = url.pathname.slice(prefix.length);
+        if (mode === "ordinary") {
+          const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+          upstreamRequests.push({ path, body });
+          const attempt = upstreamRequests.length;
+          const responseId = attempt === 1 ? FIRST_RESPONSE_ID : "resp_issue_702_resumed";
+          const text = attempt === 1 ? HISTORICAL_ASSISTANT_SENTINEL : "resumed without prior context";
+          return new Response(completedSse(responseId, text), {
+            headers: { "content-type": "text/event-stream" },
+          });
+        }
+        const target = new URL(`${path}${url.search}`, upstreamUrl!);
+        const response = await originalFetch(target, init);
+        return response;
       }
       return originalFetch(input, init);
     }) as typeof fetch;
 
     saveConfig(forwardConfig());
-    server = startServer(0);
+    server = trackCaseServer(startServer(0));
     const token = fakeChatGptJwt({ chatgpt_account_id: "acct-issue-702" });
     const requestHeaders = {
       "content-type": "application/json",
@@ -216,7 +259,6 @@ async function runForwardScenario(
 
     let firstStatus = 0;
     try {
-      if (mode === "expired") Date.now = () => realNow() - EXPIRED_AGE_MS;
       const firstResponse = await originalFetch(new URL("/v1/responses", server.url), {
         method: "POST",
         headers: requestHeaders,
@@ -229,11 +271,14 @@ async function runForwardScenario(
       });
       firstStatus = firstResponse.status;
       await firstResponse.text();
-      if (mode !== "ordinary") await waitForRecordedResponseState();
+      if (mode !== "ordinary") {
+        await waitForRecordedResponseState();
+      }
     } finally {
       Date.now = realNow;
     }
 
+    if (mode === "expired") Date.now = () => realNow() + EXPIRED_AGE_MS;
     const stateBeforeResume = responseStateMetrics();
     if (mode === "ordinary") {
       return {
@@ -269,15 +314,20 @@ async function runForwardScenario(
     Date.now = realNow;
     globalThis.fetch = originalFetch;
     try {
-      await server?.stop(true);
+      await stopCaseServer(server);
     } finally {
-      await upstream?.stop(true);
+      await stopCaseServer(upstream);
     }
   }
 }
 
 beforeEach(() => {
+  expect(globalThis.fetch).toBe(originalFetch);
+  expect(Date.now).toBe(originalDateNow);
+  expect(spendLedgerOwnerSnapshot()).toEqual({ ownership: "unheld" });
+  expect(responseStateMetrics().count).toBe(0);
   testHome = mkdtempSync(join(tmpdir(), "ocx-issue-702-"));
+  expect(readdirSync(testHome)).toEqual([]);
   process.env.OPENCODEX_HOME = testHome;
   delete process.env.OPENCODEX_API_AUTH_TOKEN;
   clearResponseStateMemoryForTests();
@@ -285,19 +335,30 @@ beforeEach(() => {
   isolatedCodexHome = installIsolatedCodexHome("ocx-issue-702-codex-");
 });
 
-afterEach(() => {
+afterEach(async () => {
+  let stopError: unknown;
+  try {
+    await stopCaseServers();
+  } catch (error) {
+    stopError = error;
+  }
   globalThis.fetch = originalFetch;
+  Date.now = originalDateNow;
   clearResponseStateForTests();
   setResponseStateByteCapForTests(null);
   resetSubagentModelFallbackStateForTests();
   isolatedCodexHome?.restore();
   isolatedCodexHome = null;
+  expect(globalThis.fetch).toBe(originalFetch);
+  expect(Date.now).toBe(originalDateNow);
+  expect(spendLedgerOwnerSnapshot()).toEqual({ ownership: "unheld" });
   if (testHome) removeTreeWithRetry(testHome);
   testHome = "";
   if (previousOpencodexHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = previousOpencodexHome;
   if (previousApiToken === undefined) delete process.env.OPENCODEX_API_AUTH_TOKEN;
   else process.env.OPENCODEX_API_AUTH_TOKEN = previousApiToken;
+  if (stopError) throw stopError;
 });
 
 describe("routed replay recovery", () => {
@@ -324,7 +385,7 @@ describe("routed replay recovery", () => {
     const tools = custom
       ? [{ type: "custom", name: "exec", description: "Run JavaScript", format: { type: "text" } }]
       : [{ type: "function", name: "lookup", parameters: { type: "object", properties: {} } }];
-    const upstream = Bun.serve({
+    const upstream = trackCaseServer(Bun.serve({
       port: 0,
       async fetch(request) {
         const body = await request.json() as Record<string, unknown>;
@@ -339,7 +400,7 @@ describe("routed replay recovery", () => {
           headers: { "content-type": "text/event-stream" },
         });
       },
-    });
+    }));
     let server: ReturnType<typeof startServer> | null = null;
     let socket: WebSocket | null = null;
     try {
@@ -364,7 +425,7 @@ describe("routed replay recovery", () => {
           },
         },
       } as OcxConfig);
-      server = startServer(0);
+      server = trackCaseServer(startServer(0));
       const deltaRequest = {
         model: "routed-test/test-model", previous_response_id: FIRST_RESPONSE_ID,
         input: [toolResult], tools, store: false,
@@ -418,8 +479,8 @@ describe("routed replay recovery", () => {
     } finally {
       Date.now = realNow;
       socket?.close();
-      await server?.stop(true);
-      await upstream.stop(true);
+      await stopCaseServer(server);
+      await stopCaseServer(upstream);
     }
   }, SERVER_BUDGET_MS);
 
@@ -436,7 +497,7 @@ describe("routed replay recovery", () => {
         id: "chatcmpl-routed", object: "chat.completion.chunk", created: 1, model: "test-model",
         choices: [{ index: 0, delta, finish_reason: finish }],
       })}\n\n`;
-    const upstream = Bun.serve({
+    const upstream = trackCaseServer(Bun.serve({
       port: 0,
       async fetch(request) {
         upstreamRequests.push(await request.json() as Record<string, unknown>);
@@ -445,7 +506,7 @@ describe("routed replay recovery", () => {
           { headers: { "content-type": "text/event-stream" } },
         );
       },
-    });
+    }));
 
     try {
       Date.now = () => realNow() - EXPIRED_AGE_MS;
@@ -478,7 +539,7 @@ describe("routed replay recovery", () => {
           },
         },
       } as OcxConfig);
-      server = startServer(0);
+      server = trackCaseServer(startServer(0));
 
       const refused = await originalFetch(new URL("/v1/responses", server.url), {
         method: "POST",
@@ -514,8 +575,8 @@ describe("routed replay recovery", () => {
       expect(forwarded).toContain(CURRENT_USER_SENTINEL);
     } finally {
       Date.now = realNow;
-      await server?.stop(true);
-      await upstream.stop(true);
+      await stopCaseServer(server);
+      await stopCaseServer(upstream);
     }
   }, SERVER_BUDGET_MS);
 
@@ -557,7 +618,7 @@ describe("routed replay recovery", () => {
             },
           },
         } as OcxConfig);
-        server = startServer(0);
+        server = trackCaseServer(startServer(0));
         const response = await originalFetch(new URL("/v1/responses", server.url), {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -576,7 +637,7 @@ describe("routed replay recovery", () => {
       } finally {
         Date.now = realNow;
         globalThis.fetch = originalFetch;
-        await server?.stop(true);
+        await stopCaseServer(server);
       }
     },
     SERVER_BUDGET_MS,
@@ -649,7 +710,7 @@ describe("Issue #702 expired forward replay state", () => {
     try {
       for (const routeClass of routeClasses) {
         saveConfig(routeClass.config);
-        const server = startServer(0);
+        const server = trackCaseServer(startServer(0));
         try {
           const response = await originalFetch(new URL("/v1/responses", server.url), {
             method: "POST",
@@ -664,7 +725,7 @@ describe("Issue #702 expired forward replay state", () => {
           expect(response.status).toBe(400);
           expect(await response.json()).toEqual({ error: LOCAL_REPLAY_UNAVAILABLE });
         } finally {
-          await server.stop(true);
+          await stopCaseServer(server);
         }
       }
       expect(upstreamCalls).toBe(0);
@@ -733,7 +794,7 @@ describe("Issue #702 expired forward replay state", () => {
         return originalFetch(input, init);
       }) as typeof fetch;
       saveConfig({ ...forwardConfig(), websockets: true });
-      server = startServer(0);
+      server = trackCaseServer(startServer(0));
       const headers = {
         authorization: `Bearer ${fakeChatGptJwt({ chatgpt_account_id: "acct-issue-702" })}`,
         "chatgpt-account-id": "acct-issue-702",
@@ -767,7 +828,7 @@ describe("Issue #702 expired forward replay state", () => {
       Date.now = realNow;
       globalThis.fetch = originalFetch;
       socket?.close();
-      await server?.stop(true);
+      await stopCaseServer(server);
     }
   }, SERVER_BUDGET_MS);
 
@@ -829,7 +890,7 @@ describe("Issue #702 expired forward replay state", () => {
       throw new Error("upstream must not be called");
     }) as typeof fetch;
     saveConfig(forwardConfig());
-    const server = startServer(0);
+    const server = trackCaseServer(startServer(0));
     const token = fakeChatGptJwt({ chatgpt_account_id: "acct-issue-702" });
     const ask = async (previousResponseId: string, threadId: string): Promise<{ status: number; body: string }> => {
       const response = await originalFetch(new URL("/v1/responses", server.url), {
@@ -865,7 +926,7 @@ describe("Issue #702 expired forward replay state", () => {
       expect(mismatch.body).toBe(missing.body);
       expect(upstreamCalls).toBe(0);
     } finally {
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   });
 
@@ -874,7 +935,7 @@ describe("Issue #702 expired forward replay state", () => {
     // the third way local replay becomes unusable, and it has to reach the client as the same
     // frame so Codex reconnects with its full input instead of terminating the task.
     const upstreamRequests: Record<string, unknown>[] = [];
-    const upstream = Bun.serve({
+    const upstream = trackCaseServer(Bun.serve({
       port: 0,
       async fetch(request) {
         upstreamRequests.push(await request.json() as Record<string, unknown>);
@@ -882,7 +943,7 @@ describe("Issue #702 expired forward replay state", () => {
           headers: { "content-type": "text/event-stream" },
         });
       },
-    });
+    }));
     let server: ReturnType<typeof startServer> | null = null;
     let socket: WebSocket | null = null;
     try {
@@ -901,7 +962,7 @@ describe("Issue #702 expired forward replay state", () => {
           },
         },
       } as OcxConfig);
-      server = startServer(0);
+      server = trackCaseServer(startServer(0));
       socket = await openResponseSocket(server.url, { "x-codex-parent-thread-id": "task-b" });
       const refused = await sendSocketTurn(socket, {
         model: "routed-test/test-model", previous_response_id: FIRST_RESPONSE_ID,
@@ -923,8 +984,8 @@ describe("Issue #702 expired forward replay state", () => {
       expect(upstreamRequests[0]!.previous_response_id).toBeUndefined();
     } finally {
       socket?.close();
-      await server?.stop(true);
-      await upstream.stop(true);
+      await stopCaseServer(server);
+      await stopCaseServer(upstream);
     }
   });
 
@@ -947,7 +1008,7 @@ describe("Issue #702 expired forward replay state", () => {
     let upstream: ReturnType<typeof Bun.serve> | null = null;
     let server: ReturnType<typeof startServer> | null = null;
     try {
-      upstream = Bun.serve({
+      upstream = trackCaseServer(Bun.serve({
         port: 0,
         async fetch(request) {
           upstreamRequests.push(await request.json() as Record<string, unknown>);
@@ -955,7 +1016,7 @@ describe("Issue #702 expired forward replay state", () => {
             headers: { "content-type": "text/event-stream" },
           });
         },
-      });
+      }));
       saveConfig({
         port: 0,
         hostname: "127.0.0.1",
@@ -971,7 +1032,7 @@ describe("Issue #702 expired forward replay state", () => {
           },
         },
       } as OcxConfig);
-      server = startServer(0);
+      server = trackCaseServer(startServer(0));
       rememberResponseState(
         { input: [inputMessage(HISTORICAL_USER_SENTINEL)], store: false },
         { id: FIRST_RESPONSE_ID, status: "completed", output: [] },
@@ -1004,8 +1065,8 @@ describe("Issue #702 expired forward replay state", () => {
       expect(upstreamRequests).toHaveLength(1);
       expect(upstreamRequests[0]!.previous_response_id).toBe("resp_never_seen_here");
     } finally {
-      await server?.stop(true);
-      await upstream?.stop(true);
+      await stopCaseServer(server);
+      await stopCaseServer(upstream);
     }
   });
 
@@ -1016,7 +1077,7 @@ describe("Issue #702 expired forward replay state", () => {
     let server: ReturnType<typeof startServer> | null = null;
 
     try {
-      upstream = Bun.serve({
+      upstream = trackCaseServer(Bun.serve({
         port: 0,
         async fetch(request) {
           upstreamRequests.push(await request.json() as Record<string, unknown>);
@@ -1024,7 +1085,7 @@ describe("Issue #702 expired forward replay state", () => {
             headers: { "content-type": "text/event-stream" },
           });
         },
-      });
+      }));
       saveConfig({
         port: 0,
         hostname: "127.0.0.1",
@@ -1040,7 +1101,7 @@ describe("Issue #702 expired forward replay state", () => {
           },
         },
       } as OcxConfig);
-      server = startServer(0);
+      server = trackCaseServer(startServer(0));
 
       const response = await originalFetch(new URL("/v1/responses", server.url), {
         method: "POST",
@@ -1069,9 +1130,9 @@ describe("Issue #702 expired forward replay state", () => {
       Date.now = realNow;
       globalThis.fetch = originalFetch;
       try {
-        await server?.stop(true);
+        await stopCaseServer(server);
       } finally {
-        await upstream?.stop(true);
+        await stopCaseServer(upstream);
       }
     }
   });

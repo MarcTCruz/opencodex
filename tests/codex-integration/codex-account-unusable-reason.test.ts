@@ -1,4 +1,5 @@
 import { CodexPoolAuthenticationError } from "../../src/codex/auth-context";
+import { writeNativeMainAuthFileForTests } from "../helpers/native-main-auth";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -22,9 +23,9 @@ let prevCodexHome: string | undefined;
 
 function writeMainAuth(): void {
   mkdirSync(CODEX_DIR, { recursive: true });
-  writeFileSync(
+  writeNativeMainAuthFileForTests(
     join(CODEX_DIR, "auth.json"),
-    JSON.stringify({ tokens: { access_token: "main_access", account_id: "main_acct" } }),
+    JSON.stringify({ tokens: { access_token: "main_access", refresh_token: "main_refresh", account_id: "main_acct" } }),
   );
 }
 
@@ -100,7 +101,7 @@ describe("codex account unusable reason", () => {
   });
 
   test("the main account without a native credential reports main_credential_unavailable", () => {
-    rmSync(join(CODEX_DIR, "auth.json"));
+    process.env.CODEX_HOME = join(CODEX_DIR, "empty-home");
     expect(codexAccountUnusableReason(makeConfig(), MAIN_CODEX_ACCOUNT_ID))
       .toBe("main_credential_unavailable");
   });

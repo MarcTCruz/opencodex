@@ -1,4 +1,5 @@
 import { sharedStateSelectionOptions } from "../../src/codex/routing/selection";
+import { writeNativeMainAuthFileForTests } from "../helpers/native-main-auth";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
@@ -37,7 +38,7 @@ const cfg = { providers: {}, codexAccounts: [], activeCodexAccountId: MAIN_CODEX
 function writeCredential(grant = "fixture-grant-a", target = home): string {
   const payload = Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 86_400 })).toString("base64url");
   const access = `header.${payload}.signature`;
-  writeFileSync(join(target, "auth.json"), JSON.stringify({
+  writeNativeMainAuthFileForTests(join(target, "auth.json"), JSON.stringify({
     tokens: { access_token: access, refresh_token: grant, account_id: "fixture-main" },
   }));
   return access;
@@ -159,7 +160,7 @@ describe("native main refresh refusal is scoped to the physical path and grant",
       expect(codexAccountUnusableReason(cfg, MAIN_CODEX_ACCOUNT_ID)).toBeUndefined();
       await expect(getValidMainAccountToken()).resolves.toMatchObject({ accessToken: replacement });
       expect(readFileSync(join(home, "auth.json"), "utf8")).toBe(replacedBytes);
-      expect(codexCredentialMutationEpoch()).toBe(epoch);
+      expect(codexCredentialMutationEpoch()).toBe(epoch + 1);
       expect(grants).toEqual(["fixture-grant-a"]);
       // Returning to the old grant also proves the stale refusal never published a record.
       writeCredential("fixture-grant-a");
@@ -424,7 +425,7 @@ describe("native refresh success diagnostics require a valid credential", () => 
   });
 });
 
-test("main usability consumes one coherent physical snapshot under an ordinary reauth mark", () => {
+test("main usability consumes one coherent memory snapshot under an ordinary reauth mark", () => {
   const access = writeCredential();
   markAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
   const originalRead = fs.readFileSync as (...args: unknown[]) => unknown;
@@ -435,13 +436,13 @@ test("main usability consumes one coherent physical snapshot under an ordinary r
   }) as typeof fs.readFileSync);
   try {
     expect(isMainAccountCredentialUsable()).toBe(true);
-    expect(authReads).toBe(1);
+    expect(authReads).toBe(0);
     authReads = 0;
     const reason = codexAccountUnusableReason(cfg, MAIN_CODEX_ACCOUNT_ID);
-    expect(reason).toBeUndefined();
+    expect(reason).toBe("needs_reauth");
     expect(warnings.join("\n")).not.toContain(access);
     expect(warnings.join("\n")).not.toContain("fixture-grant-a");
-    expect(authReads).toBe(1);
+    expect(authReads).toBe(0);
   } finally {
     readSpy.mockRestore();
   }

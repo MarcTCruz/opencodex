@@ -78,7 +78,7 @@ for (const selectedId of [MAIN_CODEX_ACCOUNT_ID, "same-login"]) {
       email: "SAME@example.test", chatgpt_account_id: "personal-scope",
     })).toString("base64url")}.signature`;
     const auth = JSON.stringify({ tokens: {
-      access_token: "main-linked-access", account_id: "personal-scope", id_token: idToken,
+      access_token: "main-linked-access", refresh_token: "main-linked-refresh", account_id: "personal-scope", id_token: idToken,
     } });
     writeFileSync(join(TEST_CODEX_HOME, "auth.json"), auth);
     seedPoolAccount(config, { id: "same-login", email: " same@example.test ", chatgptAccountId: "personal-scope" });
@@ -138,7 +138,7 @@ test("manual pause cannot publish a partial identity group while native main is 
 test("manual pause does not link a main login whose email identity is unknown", async () => {
   const config = makeConfig();
   writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-    tokens: { access_token: "opaque-main", account_id: "shared-workspace" },
+    tokens: { access_token: "opaque-main", refresh_token: "opaque-main-refresh", account_id: "shared-workspace" },
   }));
   seedPoolAccount(config, { id: "known-member", email: "member@example.test", chatgptAccountId: "shared-workspace" });
   const req = new Request("http://localhost/api/codex-auth/accounts/pause", {
@@ -184,7 +184,7 @@ test("manual pause refuses conflicting native-main workspace claims", async () =
     email: "same@example.test", chatgpt_account_id: "different-scope",
   })).toString("base64url")}.signature`;
   writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-    tokens: { access_token: "opaque-main", account_id: "wire-scope", id_token: idToken },
+    tokens: { access_token: "opaque-main", refresh_token: "opaque-main-refresh", account_id: "wire-scope", id_token: idToken },
   }));
   seedPoolAccount(config, { id: "pause-conflict", email: "same@example.test", chatgptAccountId: "different-scope" });
   const req = new Request("http://localhost/api/codex-auth/accounts/pause", {
@@ -202,7 +202,7 @@ test("manual pause refuses main tokens that name different members of one worksp
     email, chatgpt_account_id: "shared-scope",
   })).toString("base64url")}.signature`;
   writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-    tokens: { access_token: token("bob@example.test"), account_id: "shared-scope", id_token: token("alice@example.test") },
+    tokens: { access_token: token("bob@example.test"), refresh_token: "opaque-main-refresh", account_id: "shared-scope", id_token: token("alice@example.test") },
   }));
   seedPoolAccount(config, { id: "alice-login", email: "alice@example.test", chatgptAccountId: "shared-scope" });
   const req = new Request("http://localhost/api/codex-auth/accounts/pause", {
@@ -220,7 +220,7 @@ test("manual pause matches the selected workspace instead of the first organizat
     email: "same@example.test", organizations: [{ id: "other-membership" }],
   })).toString("base64url")}.signature`;
   writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-    tokens: { access_token: "opaque-main", account_id: "selected-workspace", id_token: idToken },
+    tokens: { access_token: "opaque-main", refresh_token: "opaque-main-refresh", account_id: "selected-workspace", id_token: idToken },
   }));
   seedPoolAccount(config, { id: "selected-login", email: "same@example.test", chatgptAccountId: "selected-workspace" });
   const req = new Request("http://localhost/api/codex-auth/accounts/pause", {
@@ -285,7 +285,7 @@ for (const mainState of ["oversized", "directory", "invalid-home", "api-key-malf
     } else if (mainState === "oversized") {
       // Valid ChatGPT JSON would succeed with the old unbounded reader.
       writeFileSync(authPath, JSON.stringify({
-        tokens: { access_token: "opaque-main", account_id: "main-scope" },
+        tokens: { access_token: "opaque-main", refresh_token: "opaque-main-refresh", account_id: "main-scope" },
         padding: " ".repeat(MAX_AUTH_BYTES),
       }));
     } else {

@@ -1,6 +1,7 @@
 import { registerStoredDirectIdentityTests } from "../helpers/stored-direct-identity";
+import { writeNativeMainAuthFileForTests } from "../helpers/native-main-auth";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -137,7 +138,7 @@ function config(): OcxConfig {
     activeCodexAccountId: "pool-a",
     providers: {
       routed: { adapter: "openai-chat", baseUrl: "https://routed.test/v1", apiKey: "routed-key" },
-      chatgpt: { adapter: "openai-responses", baseUrl: "https://chatgpt.test/backend-api/codex", authMode: "forward" },
+      chatgpt: { adapter: "openai-responses", baseUrl: "https://chatgpt.test/backend-api/codex", authMode: "forward", upstreamWebsocket: false,},
     },
     codexAccounts: [
       { id: "main", email: "main@example.test", isMain: true },
@@ -162,6 +163,7 @@ function guardianConfig(): OcxConfig {
       authMode: "forward",
       codexAccountMode: "pool",
       refreshPolicy: "proactive",
+      upstreamWebsocket: false,
     },
   };
   cfg.tokenGuardian = {
@@ -218,6 +220,7 @@ const forwardProvider: OcxProviderConfig = {
   adapter: "openai-responses",
   baseUrl: "https://chatgpt.test/backend-api/codex",
   authMode: "forward",
+  upstreamWebsocket: false,
 };
 
 
@@ -302,9 +305,9 @@ describe("Codex auth context", () => {
   });
 
   test("recovery excludes main from affinity, rotation, and retry while healthy pool continues", async () => {
-    writeFileSync(
+    writeNativeMainAuthFileForTests(
       join(testDir, "auth.json"),
-      JSON.stringify({ tokens: { access_token: "main_token", account_id: "main-account" } }),
+      JSON.stringify({ tokens: { access_token: "main_token", refresh_token: "main-refresh", account_id: "main-account" } }),
     );
     saveCodexAccountCredential("pool-a", {
       accessToken: "pool_token",
@@ -378,9 +381,9 @@ describe("Codex auth context", () => {
   });
 
   test("post-fence main selection rejects before injected token materialization", async () => {
-    writeFileSync(
+    writeNativeMainAuthFileForTests(
       join(testDir, "auth.json"),
-      JSON.stringify({ tokens: { access_token: "main_token", account_id: "main-account" } }),
+      JSON.stringify({ tokens: { access_token: "main_token", refresh_token: "main-refresh", account_id: "main-account" } }),
     );
     const cfg = config();
     cfg.activeCodexAccountId = MAIN_CODEX_ACCOUNT_ID;
@@ -400,8 +403,8 @@ describe("Codex auth context", () => {
       expect(nativeReads).toBe(0);
       // Selection-only quota scoring must not lazily read/cache the fenced main
       // plan before the atomic claim rejects the request.
-      writeFileSync(join(testDir, "auth.json"), JSON.stringify({
-        tokens: { access_token: chatgptPlanJwt("pro"), account_id: "main-account" },
+      writeNativeMainAuthFileForTests(join(testDir, "auth.json"), JSON.stringify({
+        tokens: { access_token: chatgptPlanJwt("pro"), refresh_token: "main-refresh", account_id: "main-account" },
       }));
       expect(getMainAccountPlan()).toBe("pro");
     } finally {
@@ -443,8 +446,8 @@ describe("Codex auth context", () => {
       // Pin retirement must not lazily score/read main while the drain fence is up.
       // A prior plan read against the intentionally missing auth.json would cache
       // `undefined` and make this post-fence JWT fallback fail.
-      writeFileSync(join(testDir, "auth.json"), JSON.stringify({
-        tokens: { access_token: chatgptPlanJwt("pro"), account_id: "main-account" },
+      writeNativeMainAuthFileForTests(join(testDir, "auth.json"), JSON.stringify({
+        tokens: { access_token: chatgptPlanJwt("pro"), refresh_token: "main-refresh", account_id: "main-account" },
       }));
       expect(getMainAccountPlan()).toBe("pro");
     } finally {
@@ -643,8 +646,8 @@ describe("Codex auth context", () => {
   test("account-gated native routing skips an active account without the model grant", async () => {
     const cfg = config();
     cfg.activeCodexAccountPinned = "pool-a";
-    writeFileSync(join(testDir, "auth.json"), JSON.stringify({
-      tokens: { access_token: "main-token", account_id: "main-account" },
+    writeNativeMainAuthFileForTests(join(testDir, "auth.json"), JSON.stringify({
+      tokens: { access_token: "main-token", refresh_token: "main-refresh", account_id: "main-account" },
     }));
     saveCodexAccountCredential("pool-a", {
       accessToken: "pool-token",
@@ -1138,8 +1141,8 @@ describe("Codex auth context", () => {
 
   test("exact main-account resolution reads auth.json without consulting the active Pool account", async () => {
     const cfg = config();
-    writeFileSync(join(testDir, "auth.json"), JSON.stringify({
-      tokens: { access_token: "opaque-live-main-token", account_id: "main-chatgpt-account" },
+    writeNativeMainAuthFileForTests(join(testDir, "auth.json"), JSON.stringify({
+      tokens: { access_token: "opaque-live-main-token", refresh_token: "main-refresh", account_id: "main-chatgpt-account" },
     }));
 
     await expect(resolveCodexAuthContext(new Headers(), cfg, "pool", {
@@ -1167,7 +1170,7 @@ describe("Codex auth context", () => {
         account_id: "operator-main-account",
       },
     });
-    writeFileSync(authPath, originalAuth);
+    writeNativeMainAuthFileForTests(authPath, originalAuth);
     const inbound = new Headers({
       authorization: "Bearer caller-keyring-token",
       "chatgpt-account-id": "caller-keyring-account",
@@ -1608,7 +1611,7 @@ describe("Codex auth context", () => {
   test("substitution fails closed when no usable main credential exists (#1686)", () => {
     // Falling through here would forward the admission secret upstream, which is exactly
     // the leak the forward guard exists to prevent. Throw before any I/O instead.
-    writeFileSync(join(testDir, "auth.json"), JSON.stringify({ tokens: {} }));
+    writeNativeMainAuthFileForTests(join(testDir, "auth.json"), JSON.stringify({ tokens: {} }));
 
     expect(() => materializeCodexUpstreamAuth(
       new Headers({ authorization: "Bearer ocx_data_localsecret" }),
@@ -2391,6 +2394,7 @@ test("context Direct bearer admission uses real stored-main materialization and 
   cfg.providers.openai = {
     adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex",
     authMode: "forward", codexAccountMode: "direct",
+    upstreamWebsocket: false,
   };
   const token = liveJwt();
   const admission = { kind: "environment", source: "bearer", contextPrincipalId: "principal-a" } as const;
@@ -2415,7 +2419,15 @@ test("context Direct bearer admission uses real stored-main materialization and 
   }, { preconnect: originalFetch.preconnect });
   try {
     for (const available of [true, false]) {
-      writeFileSync(join(testDir, "auth.json"), JSON.stringify({ tokens: available ? { access_token: token, account_id: "stored_main_acc" } : {} }));
+      const codexHome = available ? testDir : join(testDir, "without-main-credential");
+      process.env.CODEX_HOME = codexHome;
+      mkdirSync(codexHome, { recursive: true });
+      writeFileSync(join(codexHome, "config.toml"), "[features]\ncontext_management.experimental_mode = true\n");
+      if (available) {
+        writeNativeMainAuthFileForTests(join(codexHome, "auth.json"), JSON.stringify({
+          tokens: { access_token: token, refresh_token: "main-refresh", account_id: "stored_main_acc" },
+        }));
+      }
       const turn = tryAdmitTurn();
       expect(turn).not.toBeNull();
       try {

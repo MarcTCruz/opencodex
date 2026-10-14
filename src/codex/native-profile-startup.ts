@@ -141,7 +141,11 @@ export function initializeNativeMainStartupGate(
   settled = (async () => {
     try {
       await deps.beforeRecovery?.();
-      await manager.recover(false);
+      await withNativeMainExclusiveClaim(
+        manager.context,
+        () => manager.recover(false),
+        { waitMs: 10_000 },
+      );
       if (epoch === currentEpoch && probe(manager.context) === "none") {
         clearAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
         snapshot = ready(homeId);

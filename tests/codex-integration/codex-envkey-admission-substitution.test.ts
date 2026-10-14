@@ -24,6 +24,7 @@ const originalFetch = globalThis.fetch;
 const previousOcxHome = process.env.OPENCODEX_HOME;
 const previousCodexHome = process.env.CODEX_HOME;
 const previousDataToken = process.env.OPENCODEX_API_AUTH_TOKEN;
+const acquiredServers = new Set<ReturnType<typeof startServer>>();
 
 /**
  * Start the proxy with ownership scoped to THIS fixture's homes.
@@ -43,9 +44,11 @@ const previousDataToken = process.env.OPENCODEX_API_AUTH_TOKEN;
  * state files.
  */
 function startFixtureServer(): ReturnType<typeof startServer> {
-  return startServer(0, {
+  const server = startServer(0, {
     inspectNativeCodexOwnership: () => ({ ownership: "owned" as const }),
   });
+  acquiredServers.add(server);
+  return server;
 }
 
 /**
@@ -95,6 +98,7 @@ function directConfig(): OcxConfig {
         authMode: "forward",
         codexAccountMode: "direct",
         defaultModel: "gpt-5.5",
+        upstreamWebsocket: false,
       },
     },
     apiKeys: [
@@ -106,7 +110,7 @@ function directConfig(): OcxConfig {
 function writeStoredMain(accessToken: string): void {
   writeFileSync(
     join(codexHome, "auth.json"),
-    JSON.stringify({ tokens: { access_token: accessToken, account_id: "stored_main_acc" } }),
+    JSON.stringify({ tokens: { access_token: accessToken, refresh_token: "stored_main_refresh", account_id: "stored_main_acc" } }),
   );
 }
 
@@ -131,7 +135,16 @@ beforeEach(() => {
   }) as typeof fetch;
 });
 
-afterEach(() => {
+afterEach(async () => {
+  let stopError: unknown;
+  for (const server of [...acquiredServers]) {
+    try {
+      await server.stop(true);
+    } catch (error) {
+      stopError ??= error;
+    }
+  }
+  acquiredServers.clear();
   globalThis.fetch = originalFetch;
   resetDebugSettingsForTests();
   resetDebugLogBufferForTests();
@@ -145,6 +158,7 @@ afterEach(() => {
   if (codexHome) removeTreeWithRetry(codexHome);
   ocxHome = "";
   codexHome = "";
+  if (stopError) throw stopError;
 });
 
 async function postResponses(url: string | URL, authorization: string): Promise<Response> {
@@ -171,28 +185,24 @@ describe("#1686 env_key bearer admission reaches Direct with substitution", () =
     writeStoredMain(stored);
 
     const server = await startSettledFixtureServer();
-    try {
-      const response = await postResponses(server.url, `Bearer ${ADMISSION_SECRET}`);
+    const response = await postResponses(server.url, `Bearer ${ADMISSION_SECRET}`);
 
-      // Before this change the same request answered 401: admission accepted the bearer at the
-      // door, then Direct refused it because it could not tell it from a user's own credential.
-      expect(response.status).toBe(200);
-      expect(upstreamAuth).toEqual([`Bearer ${stored}`]);
-      // The proof that matters: our own secret never reached the wire.
-      expect(upstreamAuth.join("|")).not.toContain(ADMISSION_SECRET);
-      const affinityLine = getDebugLogEntries()
-        .map(entry => entry.line)
-        .find(line => line.startsWith("[ocx:codex:affinity] "));
-      expect(affinityLine).toBeDefined();
-      expect(JSON.parse(affinityLine!.slice("[ocx:codex:affinity] ".length))).toMatchObject({
-        authKind: "main",
-        accountMode: "direct",
-        credentialSubstituted: true,
-        status: 200,
-      });
-    } finally {
-      await server.stop(true);
-    }
+    // Before this change the same request answered 401: admission accepted the bearer at the
+    // door, then Direct refused it because it could not tell it from a user's own credential.
+    expect(response.status).toBe(200);
+    expect(upstreamAuth).toEqual([`Bearer ${stored}`]);
+    // The proof that matters: our own secret never reached the wire.
+    expect(upstreamAuth.join("|")).not.toContain(ADMISSION_SECRET);
+    const affinityLine = getDebugLogEntries()
+      .map(entry => entry.line)
+      .find(line => line.startsWith("[ocx:codex:affinity] "));
+    expect(affinityLine).toBeDefined();
+    expect(JSON.parse(affinityLine!.slice("[ocx:codex:affinity] ".length))).toMatchObject({
+      authKind: "main",
+      accountMode: "direct",
+      credentialSubstituted: true,
+      status: 200,
+    });
   });
 
   test("substitution fails closed before any upstream I/O when no main credential is stored", async () => {
@@ -200,16 +210,12 @@ describe("#1686 env_key bearer admission reaches Direct with substitution", () =
     writeFileSync(join(codexHome, "auth.json"), JSON.stringify({ tokens: {} }));
 
     const server = await startSettledFixtureServer();
-    try {
-      const response = await postResponses(server.url, `Bearer ${ADMISSION_SECRET}`);
+    const response = await postResponses(server.url, `Bearer ${ADMISSION_SECRET}`);
 
-      expect(response.status).toBe(401);
-      // Falling through would have forwarded the admission secret, which is the leak the
-      // forward guard exists to prevent. Nothing may reach an upstream on this path.
-      expect(upstreamAuth).toHaveLength(0);
-    } finally {
-      await server.stop(true);
-    }
+    expect(response.status).toBe(401);
+    // Falling through would have forwarded the admission secret, which is the leak the
+    // forward guard exists to prevent. Nothing may reach an upstream on this path.
+    expect(upstreamAuth).toHaveLength(0);
   });
 
   test("compact reports missing substitution credentials as authentication failure", async () => {
@@ -217,17 +223,13 @@ describe("#1686 env_key bearer admission reaches Direct with substitution", () =
     writeFileSync(join(codexHome, "auth.json"), JSON.stringify({ tokens: {} }));
 
     const server = await startSettledFixtureServer();
-    try {
-      const response = await postCompact(server.url, `Bearer ${ADMISSION_SECRET}`);
-      const body = await response.json() as { error?: { type?: string; message?: string } };
+    const response = await postCompact(server.url, `Bearer ${ADMISSION_SECRET}`);
+    const body = await response.json() as { error?: { type?: string; message?: string } };
 
-      expect(response.status).toBe(401);
-      expect(body.error?.type).toBe("authentication_error");
-      expect(body.error?.message).toBe("No usable Codex main credential to serve this request");
-      expect(upstreamAuth).toHaveLength(0);
-    } finally {
-      await server.stop(true);
-    }
+    expect(response.status).toBe(401);
+    expect(body.error?.type).toBe("authentication_error");
+    expect(body.error?.message).toBe("No usable Codex main credential to serve this request");
+    expect(upstreamAuth).toHaveLength(0);
   });
 
   test("a foreign bearer is still Codex Direct passthrough, not admission", async () => {
@@ -235,13 +237,9 @@ describe("#1686 env_key bearer admission reaches Direct with substitution", () =
     writeStoredMain(liveJwt());
 
     const server = await startSettledFixtureServer();
-    try {
-      // A real ChatGPT credential is NOT one of our secrets, so it must not be admitted as one.
-      const response = await postResponses(server.url, "Bearer sk-user-chatgpt-token");
-      expect(response.status).toBe(401);
-      expect(upstreamAuth).toHaveLength(0);
-    } finally {
-      await server.stop(true);
-    }
+    // A real ChatGPT credential is NOT one of our secrets, so it must not be admitted as one.
+    const response = await postResponses(server.url, "Bearer sk-user-chatgpt-token");
+    expect(response.status).toBe(401);
+    expect(upstreamAuth).toHaveLength(0);
   });
 });

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { writeNativeMainAuthFileForTests } from "../helpers/native-main-auth";
 import { mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -37,6 +38,7 @@ function config(): OcxConfig {
   return { port: 10100, defaultProvider: "openai", providers: { openai: {
     adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex",
     authMode: "forward", codexAccountMode: "pool",
+    upstreamWebsocket: false,
   } }, codexMainAccountHardLock: true };
 }
 
@@ -51,7 +53,7 @@ function bearer(expired = false): string {
 
 /** Write fixture credentials into the isolated home and reconcile the active main identity. */
 function writeMain(expired = false): void {
-  writeFileSync(join(home, "auth.json"), JSON.stringify({ tokens: {
+  writeNativeMainAuthFileForTests(join(home, "auth.json"), JSON.stringify({ tokens: {
     access_token: bearer(expired), refresh_token: "fixture-refresh", account_id: accountId,
   } }));
   reconcileMainCodexAccountRuntimeState();
@@ -349,7 +351,7 @@ describe("main hard-lock background recovery", () => {
   test("a replacement main credential does not inherit recovery backoff", async () => {
     const calls = fetchWith(async () => usage(99));
     await runMainAccountHardLockRecovery(config());
-    writeFileSync(join(home, "auth.json"), JSON.stringify({ tokens: {
+    writeNativeMainAuthFileForTests(join(home, "auth.json"), JSON.stringify({ tokens: {
       access_token: bearer() + "replacement", refresh_token: "fixture-new", account_id: accountId,
     } }));
     reconcileMainCodexAccountRuntimeState();
@@ -379,7 +381,7 @@ describe("main hard-lock background recovery", () => {
     const pending = fetchMainAccountInfoAttempt(true, 0);
     try {
       await started.promise;
-      writeFileSync(authPath, JSON.stringify(replacement));
+      writeNativeMainAuthFileForTests(authPath, JSON.stringify(replacement));
       expect((await fetchMainAccountInfoAttempt(true, 0)).quotaRefresh?.status).toBe("http_error");
       const info = structuredClone(getMainAccountInfoCache());
       finish.resolve();
@@ -425,11 +427,11 @@ describe("main hard-lock background recovery", () => {
       try {
         await started.promise;
         if (transition !== "unchanged") {
-          writeFileSync(authPath, JSON.stringify(replacement));
+          writeNativeMainAuthFileForTests(authPath, JSON.stringify(replacement));
           // A newer read observes the bearer but fails, so it cannot advance the publication fence.
           expect((await fetchMainAccountInfoAttempt(true, 0)).quotaRefresh?.status).toBe("http_error");
           if (transition === "restored") {
-            writeFileSync(authPath, originalAuth);
+            writeNativeMainAuthFileForTests(authPath, originalAuth);
             expect((await fetchMainAccountInfoAttempt(true, 0)).quotaRefresh?.status).toBe("http_error");
           }
         }
@@ -490,7 +492,7 @@ describe("main hard-lock background recovery", () => {
     const pending = listCodexAuthAccounts(config(), true);
     try {
       await started.promise;
-      writeFileSync(authPath, JSON.stringify(replacement));
+      writeNativeMainAuthFileForTests(authPath, JSON.stringify(replacement));
       expect((await fetchMainAccountInfoAttempt(true, 0)).quotaRefresh?.status).toBe("http_error");
       const cached = structuredClone(getMainAccountInfoCache());
       finish.resolve();
@@ -530,14 +532,14 @@ describe("main hard-lock background recovery", () => {
         const pending = fetchMainAccountInfoSnapshot(true, config());
         try {
           await started.promise;
-          if (transition === "replaced") writeFileSync(authPath, JSON.stringify(replacement));
-          if (transition === "unreadable") writeFileSync(authPath, "{");
+          if (transition === "replaced") writeNativeMainAuthFileForTests(authPath, JSON.stringify(replacement));
+          if (transition === "unreadable") writeNativeMainAuthFileForTests(authPath, "{");
           const cached = structuredClone(getMainAccountInfoCache());
           const policy = getMainPolicyQuota();
           finish.resolve();
           const snapshot = await pending;
           expect(reads).toBe(1);
-          if (transition === "unchanged") {
+          if (transition !== "replaced") {
             if (status === 200) {
               expect(getMainAccountInfoCache()?.quota?.weeklyPercent).toBe(64);
               expect(getMainAccountHardLockStatus(config()).state).toBe("ready");
@@ -595,10 +597,10 @@ describe("main hard-lock background recovery", () => {
         try {
           await Promise.race([started.promise, pending.then(() => { throw new Error("Terminal WHAM never started"); })]);
           if (transition !== "unchanged") {
-            writeFileSync(authPath, JSON.stringify(replacement));
+            writeNativeMainAuthFileForTests(authPath, JSON.stringify(replacement));
             expect((await fetchMainAccountInfoAttempt(true, 0)).quotaRefresh?.status).toBe("http_error");
             if (transition === "restored") {
-              writeFileSync(authPath, originalAuth);
+              writeNativeMainAuthFileForTests(authPath, originalAuth);
               expect((await fetchMainAccountInfoAttempt(true, 0)).quotaRefresh?.status).toBe("http_error");
             }
           }
@@ -632,7 +634,7 @@ describe("main hard-lock background recovery", () => {
     test.each([false, true])(`conflicting main tuple cannot publish ${status}, replacement=%s`, async replaced => {
       const authPath = join(home, "auth.json");
       const valid = JSON.parse(readFileSync(authPath, "utf8"));
-      writeFileSync(authPath, JSON.stringify({ tokens: { ...valid.tokens, account_id: "fixture-other-header" } }));
+      writeNativeMainAuthFileForTests(authPath, JSON.stringify({ tokens: { ...valid.tokens, account_id: "fixture-other-header" } }));
       setMainAccountInfoCache({ email: null, plan: "plus", quota: { shortPercent: 99 }, ts: 1 });
       if (status === 200) markAccountNeedsReauth(MAIN);
       const started = deferred<void>();
@@ -651,7 +653,7 @@ describe("main hard-lock background recovery", () => {
         await Promise.race([started.promise, pending.then(() => { throw new Error("Conflicting WHAM never started"); })]);
         if (replaced) {
           valid.tokens.access_token += "-rotated";
-          writeFileSync(authPath, JSON.stringify(valid));
+          writeNativeMainAuthFileForTests(authPath, JSON.stringify(valid));
           expect((await fetchMainAccountInfoAttempt(true, 0)).quotaRefresh?.status).toBe("http_error");
         }
         const info = structuredClone(getMainAccountInfoCache());
@@ -819,9 +821,9 @@ describe("main hard-lock background recovery", () => {
     }
   });
 
-  test.each(["http", "transport", "metadata", "negative", "missing-token"] as const)("%s failure retains policy evidence", async kind => {
+  test.each(["http", "transport", "metadata", "negative", "deleted-during-grace"] as const)("%s failure retains policy evidence", async kind => {
     const retained = getMainPolicyQuota();
-    if (kind === "missing-token") unlinkSync(join(home, "auth.json"));
+    if (kind === "deleted-during-grace") unlinkSync(join(home, "auth.json"));
     const calls = fetchWith(async () => {
       if (kind === "transport") throw new Error("fixture network failure");
       if (kind === "http") return new Response(null, { status: 503 });
@@ -829,7 +831,7 @@ describe("main hard-lock background recovery", () => {
       return usage(-1);
     });
     await runMainAccountHardLockRecovery(config());
-    expect(calls).toEqual(kind === "missing-token" ? [] : [whamUrl]);
+    expect(calls).toEqual([whamUrl]);
     expect(getMainPolicyQuota()).toEqual(retained);
     expect(getMainAccountHardLockStatus(config()).state).toBe("blocked");
     expect(isAccountNeedsReauth(MAIN)).toBe(false);

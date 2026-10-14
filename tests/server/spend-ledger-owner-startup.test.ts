@@ -20,6 +20,34 @@ import { removeTreeWithRetry } from "../helpers/remove-tree";
 let home = "";
 let previousHome: string | undefined;
 let codexHome: IsolatedCodexHome | null = null;
+type CaseServer = ReturnType<typeof startServer> | ReturnType<typeof Bun.serve>;
+const caseServers: CaseServer[] = [];
+const caseServerStops = new WeakMap<CaseServer, Promise<void>>();
+
+function trackCaseServer<T extends CaseServer>(server: T): T {
+  caseServers.push(server);
+  return server;
+}
+
+function stopCaseServer(server: CaseServer): Promise<void> {
+  const existing = caseServerStops.get(server);
+  if (existing) return existing;
+  const stopping = Promise.resolve().then(() => server.stop(true));
+  caseServerStops.set(server, stopping);
+  return stopping;
+}
+
+async function stopCaseServers(): Promise<void> {
+  let stopError: unknown;
+  for (const server of caseServers.splice(0).reverse()) {
+    try {
+      await stopCaseServer(server);
+    } catch (error) {
+      stopError ??= error;
+    }
+  }
+  if (stopError) throw stopError;
+}
 
 function config(): OcxConfig {
   return {
@@ -40,18 +68,26 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  let stopError: unknown;
+  try {
+    await stopCaseServers();
+  } catch (error) {
+    stopError = error;
+  }
   await flushNativeMainStartupReleases();
   await flushConfigDirHardeningForTests();
   resetSharedSpendLedgerForTest();
+  expect(spendLedgerOwnerSnapshot().ownership).toBe("unheld");
   if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = previousHome;
   codexHome?.restore();
   codexHome = null;
   removeTreeWithRetry(home);
+  if (stopError) throw stopError;
 });
 
 test("startServer acquires before serving and final stop releases", async () => {
-  const server = startServer(0);
+  const server = trackCaseServer(startServer(0));
   expect(spendLedgerOwnerSnapshot().ownership).toBe("held");
   try {
     const adminToken = readFileSync(join(home, "admin-api-token"), "utf8").trim();
@@ -73,7 +109,7 @@ test("startServer acquires before serving and final stop releases", async () => 
     expect(existsSync(join(home, SPEND_LEDGER_JOURNAL_FILENAME))).toBe(false);
     expect(existsSync(join(home, SPEND_LEDGER_SALT_FILENAME))).toBe(false);
   } finally {
-    await server.stop(true);
+    await stopCaseServer(server);
   }
   expect(spendLedgerOwnerSnapshot().ownership).toBe("unheld");
 });
@@ -88,7 +124,7 @@ async function waitForOwnership(expected: "held" | "unheld"): Promise<void> {
 }
 
 test("a partial start that bound public before an auxiliary failure releases ownership", async () => {
-  const blocker = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("blocked") });
+  const blocker = trackCaseServer(Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("blocked") }));
   try {
     const candidate = config();
     candidate.unauthenticatedLoopbackListener = { enabled: true, port: blocker.port };
@@ -101,6 +137,6 @@ test("a partial start that bound public before an auxiliary failure releases own
     const next = acquireSpendLedgerOwner();
     next.release();
   } finally {
-    await blocker.stop(true);
+    await stopCaseServer(blocker);
   }
 });

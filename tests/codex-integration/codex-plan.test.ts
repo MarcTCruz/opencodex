@@ -117,6 +117,7 @@ describe("getMainAccountPlan JWT fallback", () => {
     writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
       tokens: {
         access_token: chatgptPlanJwt("pro", "acct-main-jwt"),
+        refresh_token: "main-plan-refresh",
         account_id: "acct-main-jwt",
       },
     }));

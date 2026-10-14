@@ -291,15 +291,28 @@ only the refresh's own 30-second timeout: success rotates and retires the old
 refresh token, so cancellation cannot discard the only live grant. Both locks
 await the callback through completion, including publication; aborting their
 wait signal does not release an acquired lock while the exchange runs.
-Successful refresh publishes access and refresh tokens and advances the
-credential mutation epoch before clearing grant rejection and applicable
-reauth quarantine, then throws the caller's abort reason if cancelled.
-Snapshot and identity checks still refuse to overwrite an external auth writer,
-including when the caller also cancelled. A save refused after a successful
-exchange serves the new access token to that request only: auth.json stays as
-the other writer left it, the rotated grant is kept nowhere, and the old grant
-is not marked rejected (#2999). Same-identity device reauth obtains a new login
-grant rather than rotating the existing grant and keeps its pre-publication fence.
+The native-main store watches CODEX_HOME/auth.json, is the sole OpenCodex writer,
+and serves readers from its last complete in-memory snapshot.
+ChatGPT envelopes need non-empty access and refresh tokens; API-key envelopes need a non-empty key.
+Refresh captures file identity, digest, and observation generation before exchange;
+the same fence governs publication and retries, blocking later changes even when
+the caller cancels. Complete external credentials win without expiry or account
+precedence. Invalid or unreadable content and missing-file grace retain the
+last complete credential and block refresh/writes; confirmed deletion clears
+memory after ten minutes. A hiccup keeps the rotated grant in memory; retries keep its original fence.
+
+- `written`: The file and memory hold the rotated grant; the request gets its stored access token.
+- `retained`: Memory holds the rotated grant pending retry; the request gets its memory access token.
+- `recovery-required`: Memory holds the pending grant for recovery; the request gets the exchanged access token.
+- `superseded`: Memory adopts a complete external credential; this request gets the exchanged access token.
+- `deleted`: Confirmed deletion clears memory; the request gets no token.
+- `stopped`: The store publishes no rotated grant; the request gets no token.
+
+For `superseded` and `recovery-required`, the in-flight access token goes to the request while memory
+independently follows the file observation; neither refusal marks the old grant rejected (#2999).
+Written and retained results advance the credential mutation epoch before clearing grant rejection and
+applicable reauth quarantine, then surface caller cancellation. Same-identity device reauth obtains a
+new login grant through the central writer under its existing pre-publication claim.
 
 ## Native-main refresh ownership
 
@@ -331,7 +344,7 @@ share the operation; equal emails in different workspaces and different members 
 remain independent. Missing identity evidence never links entries. Main's ID and access tokens must
 agree on both workspace and member email; a disagreement returns 503. Main discovery, group publication
 and config persistence hold native-main admission and, when the home exists, the cross-process
-shared claim. Main reads use the claim's pinned auth path and bounded regular-file reader. A positively
+shared claim. Main reads use the claim's pinned auth path and native-main memory snapshot. A positively
 absent home or valid API-key-only envelope has no ChatGPT main identity: Pool-only grouping proceeds,
 and main remains independently addressable by id. An inaccessible existing home, busy claim, malformed
 credentials, or unreadable/nonregular/oversized auth file returns 503 before any group publication.

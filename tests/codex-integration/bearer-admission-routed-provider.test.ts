@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { saveConfig } from "../../src/config";
 import { clearComboTargetCooldowns } from "../../src/combos/failover";
+import { spendLedgerOwnerSnapshot } from "../../src/lib/spend-ledger-owner";
 import { startServer } from "../../src/server";
 import { noteSubagentModelFailure, resetSubagentModelFallbackStateForTests } from "../../src/codex/subagent-model-fallback";
 import { closeRequestHistoryIndex } from "../../src/routing/history/indexer";
@@ -52,6 +53,9 @@ let codexHome = "";
 let routedAuth: Array<string | null> = [];
 let nativeAuth: Array<string | null> = [];
 let nativeAccountIds: Array<string | null> = [];
+const caseServers = new Set<ReturnType<typeof startServer>>();
+const caseServerStops = new WeakMap<ReturnType<typeof startServer>, Promise<void>>();
+const caseServerCleanups: Array<() => Promise<void>> = [];
 
 const ADMISSION_SECRET = "ocx_data_2132secret";
 const ROUTED_KEY = "sk-routed-provider-key";
@@ -81,6 +85,7 @@ function mixedConfig(): OcxConfig {
         authMode: "forward",
         codexAccountMode: "direct",
         defaultModel: "gpt-5.5",
+        upstreamWebsocket: false,
       },
       gateway: {
         adapter: "openai-chat",
@@ -125,7 +130,13 @@ async function withCursorCaptureServer<T>(
 ): Promise<T> {
   const capturedAuth: Array<string | null> = [];
   const sessions = new Set<http2.ServerHttp2Session>();
+  let stopping: Promise<void> | undefined;
   const server = http2.createServer();
+  const stop = (): Promise<void> => stopping ??= (async () => {
+    for (const session of sessions) session.destroy();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  })();
+  trackCaseServerCleanup(stop);
   server.on("session", session => {
     sessions.add(session);
     session.once("close", () => sessions.delete(session));
@@ -157,12 +168,12 @@ async function withCursorCaptureServer<T>(
   try {
     return await run(`http://127.0.0.1:${address.port}`, capturedAuth);
   } finally {
-    for (const session of sessions) session.destroy();
-    await new Promise<void>(resolve => server.close(() => resolve()));
+    await stop();
   }
 }
 
 beforeEach(() => {
+  expect(spendLedgerOwnerSnapshot().ownership).toBe("unheld");
   resetVisionDescriptionCache();
   clearComboTargetCooldowns();
   resetSubagentModelFallbackStateForTests();
@@ -198,7 +209,41 @@ beforeEach(() => {
   }) as typeof fetch;
 });
 
+function startTrackedServer(...args: Parameters<typeof startServer>): ReturnType<typeof startServer> {
+  const server = startServer(...args);
+  caseServers.add(server);
+  return server;
+}
+
+function stopTrackedServer(server: ReturnType<typeof startServer>): Promise<void> {
+  const existing = caseServerStops.get(server);
+  if (existing) return existing;
+  const stopping = Promise.resolve().then(() => server.stop(true));
+  caseServerStops.set(server, stopping);
+  return stopping;
+}
+
+function trackCaseServerCleanup(cleanup: () => Promise<void>): void {
+  caseServerCleanups.push(cleanup);
+}
+
 afterEach(async () => {
+  let stopError: unknown;
+  for (const server of caseServers) {
+    try {
+      await stopTrackedServer(server);
+    } catch (error) {
+      stopError ??= error;
+    }
+  }
+  caseServers.clear();
+  for (const cleanup of caseServerCleanups.splice(0).reverse()) {
+    try {
+      await cleanup();
+    } catch (error) {
+      stopError ??= error;
+    }
+  }
   resetVisionDescriptionCache();
   closeRequestHistoryIndex();
   clearComboTargetCooldowns();
@@ -212,11 +257,13 @@ afterEach(async () => {
   else process.env.CODEX_HOME = previousCodexHome;
   if (previousDataToken === undefined) delete process.env.OPENCODEX_API_AUTH_TOKEN;
   else process.env.OPENCODEX_API_AUTH_TOKEN = previousDataToken;
+  expect(spendLedgerOwnerSnapshot().ownership).toBe("unheld");
   // Startup's config-dir ACL hardening may still hold the homes on Windows; settle it first.
   if (ocxHome) await removeTreeAfterBackgroundWork(ocxHome);
   if (codexHome) await removeTreeAfterBackgroundWork(codexHome);
   ocxHome = "";
   codexHome = "";
+  if (stopError) throw stopError;
 });
 
 async function postResponses(
@@ -268,7 +315,7 @@ async function postClaudeMessages(
 }
 
 async function startOwnedServer(): Promise<ReturnType<typeof startServer>> {
-  const server = startServer(0, { inspectNativeCodexOwnership });
+  const server = startTrackedServer(0, { inspectNativeCodexOwnership });
   await waitForNativeMainStartupGate();
   return server;
 }
@@ -279,7 +326,7 @@ describe("#2132 bearer admission does not require a ChatGPT credential for route
     // The reported install: no ChatGPT login was ever performed.
     writeFileSync(join(codexHome, "auth.json"), JSON.stringify({ tokens: {} }));
 
-    const server = startServer(0, { inspectNativeCodexOwnership });
+    const server = startTrackedServer(0, { inspectNativeCodexOwnership });
     try {
       const response = await postResponses(server.url, "gateway/gateway-model");
 
@@ -291,7 +338,7 @@ describe("#2132 bearer admission does not require a ChatGPT credential for route
       expect(routedAuth.join("|")).not.toContain(ADMISSION_SECRET);
       expect(nativeAuth).toHaveLength(0);
     } finally {
-      await server.stop(true);
+      await stopTrackedServer(server);
     }
   });
 
@@ -299,7 +346,7 @@ describe("#2132 bearer admission does not require a ChatGPT credential for route
     saveConfig(mixedConfig());
     writeFileSync(join(codexHome, "auth.json"), JSON.stringify({ tokens: {} }));
 
-    const server = startServer(0, { inspectNativeCodexOwnership });
+    const server = startTrackedServer(0, { inspectNativeCodexOwnership });
     try {
       await waitForNativeMainStartupGate();
       const response = await postResponses(server.url, "gpt-5.5");
@@ -310,7 +357,7 @@ describe("#2132 bearer admission does not require a ChatGPT credential for route
       expect(nativeAuth).toHaveLength(0);
       expect(routedAuth).toHaveLength(0);
     } finally {
-      await server.stop(true);
+      await stopTrackedServer(server);
     }
   });
 
@@ -319,10 +366,10 @@ describe("#2132 bearer admission does not require a ChatGPT credential for route
     const stored = liveJwt();
     writeFileSync(
       join(codexHome, "auth.json"),
-      JSON.stringify({ tokens: { access_token: stored, account_id: "stored_main_acc" } }),
+      JSON.stringify({ tokens: { access_token: stored, refresh_token: "stored_main_refresh", account_id: "stored_main_acc" } }),
     );
 
-    const server = startServer(0, { inspectNativeCodexOwnership });
+    const server = startTrackedServer(0, { inspectNativeCodexOwnership });
     try {
       await waitForNativeMainStartupGate();
       const response = await postResponses(server.url, "gpt-5.5");
@@ -331,7 +378,7 @@ describe("#2132 bearer admission does not require a ChatGPT credential for route
       expect(nativeAuth).toEqual([`Bearer ${stored}`]);
       expect(nativeAuth.join("|")).not.toContain(ADMISSION_SECRET);
     } finally {
-      await server.stop(true);
+      await stopTrackedServer(server);
     }
   });
 });
@@ -342,14 +389,14 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
       saveConfig(cursorForwardConfig(baseUrl));
       writeFileSync(join(codexHome, "auth.json"), JSON.stringify({ tokens: {} }));
 
-      const server = startServer(0, { inspectNativeCodexOwnership });
+      const server = startTrackedServer(0, { inspectNativeCodexOwnership });
       try {
         const response = await postResponses(server.url, "cursorcustom/auto");
         // The runTurn adapter reports its pre-dispatch failure in a Responses terminal.
         expect(await response.json()).toMatchObject({ status: "failed" });
         expect(capturedAuth).toEqual([]);
       } finally {
-        await server.stop(true);
+        await stopTrackedServer(server);
       }
     });
   });
@@ -359,7 +406,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
       saveConfig(cursorForwardConfig(baseUrl));
       writeFileSync(join(codexHome, "auth.json"), JSON.stringify({ tokens: {} }));
 
-      const server = startServer(0, { inspectNativeCodexOwnership });
+      const server = startTrackedServer(0, { inspectNativeCodexOwnership });
       try {
         await postResponses(server.url, "cursorcustom/auto", {
           "x-opencodex-api-key": ADMISSION_SECRET,
@@ -367,7 +414,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
         });
         expect(capturedAuth).toEqual(["Bearer cursor-upstream-token"]);
       } finally {
-        await server.stop(true);
+        await stopTrackedServer(server);
       }
     });
   });
@@ -377,12 +424,12 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
       saveConfig(cursorForwardConfig(baseUrl, "cursor-configured-token"));
       writeFileSync(join(codexHome, "auth.json"), JSON.stringify({ tokens: {} }));
 
-      const server = startServer(0, { inspectNativeCodexOwnership });
+      const server = startTrackedServer(0, { inspectNativeCodexOwnership });
       try {
         await postResponses(server.url, "cursorcustom/auto");
         expect(capturedAuth).toEqual(["Bearer cursor-configured-token"]);
       } finally {
-        await server.stop(true);
+        await stopTrackedServer(server);
       }
     });
   });
@@ -392,7 +439,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
       saveConfig(cursorForwardConfig(baseUrl));
       writeFileSync(join(codexHome, "auth.json"), JSON.stringify({ tokens: {} }));
 
-      const server = startServer(0, { inspectNativeCodexOwnership });
+      const server = startTrackedServer(0, { inspectNativeCodexOwnership });
       try {
         const response = await postResponses(server.url, "cursorcustom/auto", {
           "x-opencodex-api-key": ADMISSION_SECRET,
@@ -401,7 +448,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
         expect(response.status).toBe(401);
         expect(capturedAuth).toEqual([]);
       } finally {
-        await server.stop(true);
+        await stopTrackedServer(server);
       }
     });
   });
@@ -411,7 +458,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
       saveConfig(cursorForwardConfig(baseUrl, "cursor-configured-token"));
       writeFileSync(join(codexHome, "auth.json"), JSON.stringify({ tokens: {} }));
 
-      const server = startServer(0, { inspectNativeCodexOwnership });
+      const server = startTrackedServer(0, { inspectNativeCodexOwnership });
       try {
         await postResponses(server.url, "cursorcustom/auto", {
           "x-opencodex-api-key": ADMISSION_SECRET,
@@ -419,7 +466,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
         });
         expect(capturedAuth).toEqual(["Bearer cursor-configured-token"]);
       } finally {
-        await server.stop(true);
+        await stopTrackedServer(server);
       }
     });
   });
@@ -428,7 +475,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
     await withCursorCaptureServer(async (baseUrl, capturedAuth) => {
       saveConfig(cursorForwardConfig(baseUrl));
       writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
-        tokens: { access_token: liveJwt(), account_id: "stored_main_acc" },
+        tokens: { access_token: liveJwt(), refresh_token: "stored_main_refresh", account_id: "stored_main_acc" },
       }));
 
       const server = await startOwnedServer();
@@ -439,7 +486,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
         });
         expect(capturedAuth).toEqual(["Bearer cursor-upstream-token"]);
       } finally {
-        await server.stop(true);
+        await stopTrackedServer(server);
       }
     });
   });
@@ -460,6 +507,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
       config.providers.openai = {
         adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex",
         authMode: "forward", codexAccountMode: "direct",
+        upstreamWebsocket: false,
       };
       config.visionSidecar = { enabled: true, backend: "openai", model: "gpt-5.6-luna" };
       if (scenario === "default-sidecars") delete config.visionSidecar;
@@ -477,7 +525,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
       if (scenario === "noncanonical-openai") {
         // Keep the reserved OpenAI row absent; a custom forward provider is valid config
         // but is not authority to inject stored ChatGPT credentials into a sidecar.
-        config.providers.mirror = { adapter: "openai-responses", authMode: "forward", baseUrl: "https://mirror.example.com/v1" };
+        config.providers.mirror = { adapter: "openai-responses", authMode: "forward", baseUrl: "https://mirror.example.com/v1", upstreamWebsocket: false,};
         delete config.providers.openai;
       }
       const search = scenario.startsWith("search-");
@@ -486,7 +534,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
       saveConfig(config);
       const stored = fakeChatGptJwt({ chatgpt_account_id: "stored_main_acc", exp: Math.floor(Date.now() / 1000) + 3600 });
       writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
-        tokens: scenario === "no-stored-main" ? {} : { access_token: stored, account_id: "stored_main_acc" },
+        tokens: scenario === "no-stored-main" ? {} : { access_token: stored, refresh_token: "stored_main_refresh", account_id: "stored_main_acc" },
       }));
       const server = await startOwnedServer();
       let settled = false;
@@ -523,7 +571,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
         expect(nativeAuth).toEqual([]);
       } finally {
         releaseUpstream();
-        try { await (await pending).text(); } finally { await server.stop(true); }
+        try { await (await pending).text(); } finally { await stopTrackedServer(server); }
       }
       expect(getNativeMainProfileRequestCount()).toBe(0);
     }, async () => { signalStarted(); await upstreamGate; });
@@ -541,12 +589,13 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
       config.providers.openai = {
         adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex",
         authMode: "forward", codexAccountMode: "direct",
+        upstreamWebsocket: false,
       };
       config.webSearchSidecar = { enabled: true, backend: "openai", model: "gpt-5.6-luna" };
       saveConfig(config);
       const stored = fakeChatGptJwt({ chatgpt_account_id: "stored_main_acc", exp: Math.floor(Date.now() / 1000) + 3600 });
       writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
-        tokens: { access_token: stored, account_id: "stored_main_acc" },
+        tokens: { access_token: stored, refresh_token: "stored_main_refresh", account_id: "stored_main_acc" },
       }));
       const server = await startOwnedServer();
       let settled = false;
@@ -575,7 +624,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
         expect(nativeAuth).toEqual([]);
       } finally {
         releaseUpstream();
-        try { await (await pending).text(); } finally { await server.stop(true); }
+        try { await (await pending).text(); } finally { await stopTrackedServer(server); }
       }
       expect(getNativeMainProfileRequestCount()).toBe(0);
       expect(capturedAuth).toEqual(["Bearer cursor-upstream-token"]);
@@ -590,6 +639,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
       config.providers.openai = {
         adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex",
         authMode: "forward", codexAccountMode: pool ? "pool" : "direct",
+        upstreamWebsocket: false,
       };
       // Keep this auth fixture independent of the legacy sidecar model migration.
       config.visionSidecar = { enabled: true, backend: "openai", model: "gpt-5.6-luna" };
@@ -605,7 +655,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
       saveConfig(config);
       const stored = fakeChatGptJwt({ chatgpt_account_id: "stored_main_acc", exp: Math.floor(Date.now() / 1000) + 3600 });
       writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
-        tokens: { access_token: stored, account_id: "stored_main_acc" },
+        tokens: { access_token: stored, refresh_token: "stored_main_refresh", account_id: "stored_main_acc" },
       }));
       const sidecar: Array<{ authorization: string | null; account: string | null; claimed: boolean }> = [];
       globalThis.fetch = (async (input, init) => {
@@ -628,7 +678,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
         return originalFetch(input, init);
       }) as typeof fetch;
       const fenced = ownership.endsWith("fenced");
-      const server = !fenced ? await startOwnedServer() : startServer(0, {
+      const server = !fenced ? await startOwnedServer() : startTrackedServer(0, {
         inspectNativeCodexOwnership: () => ({ ownership: "foreign", reason: "fixture owned by another service" }),
       });
       try {
@@ -650,7 +700,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
             account: pool ? "sidecar_pool_acc" : "stored_main_acc", claimed: !pool }]);
         expect(capturedAuth).toEqual(["Bearer cursor-upstream-token"]);
       } finally {
-        await server.stop(true);
+        await stopTrackedServer(server);
       }
       expect(getNativeMainProfileRequestCount()).toBe(0);
     });
@@ -660,7 +710,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
     await withCursorCaptureServer(async (baseUrl, capturedAuth) => {
       saveConfig(cursorForwardConfig(baseUrl));
       writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
-        tokens: { access_token: liveJwt(), account_id: "stored_main_acc" },
+        tokens: { access_token: liveJwt(), refresh_token: "stored_main_refresh", account_id: "stored_main_acc" },
       }));
 
       const server = await startOwnedServer();
@@ -671,7 +721,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
         expect(response.status).not.toBe(200);
         expect(capturedAuth).toEqual([]);
       } finally {
-        await server.stop(true);
+        await stopTrackedServer(server);
       }
     });
   });
@@ -680,7 +730,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
     await withCursorCaptureServer(async (baseUrl, capturedAuth) => {
       saveConfig(cursorForwardConfig(baseUrl));
       writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
-        tokens: { access_token: liveJwt(), account_id: "stored_main_acc" },
+        tokens: { access_token: liveJwt(), refresh_token: "stored_main_refresh", account_id: "stored_main_acc" },
       }));
 
       const server = await startOwnedServer();
@@ -691,7 +741,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
         expect(response.status).not.toBe(200);
         expect(capturedAuth).toEqual([]);
       } finally {
-        await server.stop(true);
+        await stopTrackedServer(server);
       }
     });
   });
@@ -718,7 +768,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
         }
         expect(capturedAuth).toEqual([]);
       } finally {
-        await server.stop(true);
+        await stopTrackedServer(server);
       }
     });
   });
@@ -764,7 +814,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
           }
           expect(capturedAuth).toEqual([]);
         } finally {
-          await server.stop(true);
+          await stopTrackedServer(server);
         }
       });
     }
@@ -794,7 +844,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
           await response.text();
           expect(capturedAuth).toEqual([`Bearer ${bearer}`]);
         } finally {
-          await server.stop(true);
+          await stopTrackedServer(server);
         }
       });
     }
@@ -808,7 +858,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
       };
       saveConfig(config);
       writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
-        tokens: { access_token: liveJwt(), account_id: "stored_main_acc" },
+        tokens: { access_token: liveJwt(), refresh_token: "stored_main_refresh", account_id: "stored_main_acc" },
       }));
 
       const server = await startOwnedServer();
@@ -821,7 +871,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
         expect(response.status).not.toBe(200);
         expect(capturedAuth).toEqual([]);
       } finally {
-        await server.stop(true);
+        await stopTrackedServer(server);
       }
     });
   });
@@ -835,7 +885,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
       saveConfig(config);
       writeFileSync(join(codexHome, "auth.json"), JSON.stringify({ tokens: {} }));
 
-      const server = startServer(0, { inspectNativeCodexOwnership });
+      const server = startTrackedServer(0, { inspectNativeCodexOwnership });
       try {
         const response = await postResponses(server.url, "combo/free", {
           "x-opencodex-api-key": ADMISSION_SECRET,
@@ -845,7 +895,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
         expect(response.status).not.toBe(200);
         expect(capturedAuth).toEqual([]);
       } finally {
-        await server.stop(true);
+        await stopTrackedServer(server);
       }
     });
   });
@@ -882,7 +932,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
     saveConfig(config);
     writeFileSync(
       join(codexHome, "auth.json"),
-      JSON.stringify({ tokens: { access_token: stored, account_id: "stored_main_acc" } }),
+      JSON.stringify({ tokens: { access_token: stored, refresh_token: "stored_main_refresh", account_id: "stored_main_acc" } }),
     );
 
     const server = await startOwnedServer();
@@ -892,7 +942,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
       expect(nativeAuth).toEqual([`Bearer ${stored}`]);
       expect(nativeAuth.join("|")).not.toContain(ADMISSION_SECRET);
     } finally {
-      await server.stop(true);
+      await stopTrackedServer(server);
     }
   });
 
@@ -930,7 +980,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
           expect(nativeAccountIds).toEqual([]);
         }
       } finally {
-        await server.stop(true);
+        await stopTrackedServer(server);
       }
     },
   );
@@ -944,6 +994,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
         authMode: "forward",
         codexAccountMode: "direct",
         defaultModel: "gpt-5.6-luna",
+        upstreamWebsocket: false,
       };
       config.subagentModelFallback = ["gpt-5.6-luna"];
       const stored = liveJwt();
@@ -951,7 +1002,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
       noteSubagentModelFailure("cursorcustom/auto", "429", config);
       writeFileSync(
         join(codexHome, "auth.json"),
-        JSON.stringify({ tokens: { access_token: stored, account_id: "stored_main_acc" } }),
+        JSON.stringify({ tokens: { access_token: stored, refresh_token: "stored_main_refresh", account_id: "stored_main_acc" } }),
       );
 
       const server = await startOwnedServer();
@@ -965,7 +1016,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
         expect(nativeAuth).toEqual([]);
         expect(response.status).toBe(401);
       } finally {
-        await server.stop(true);
+        await stopTrackedServer(server);
       }
     });
   });
@@ -979,6 +1030,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
         authMode: "forward",
         codexAccountMode: "direct",
         defaultModel: "gpt-5.6-luna",
+        upstreamWebsocket: false,
       };
       config.subagentModelFallback = ["gpt-5.6-luna"];
       const stored = liveJwt();
@@ -986,7 +1038,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
       noteSubagentModelFailure("cursorcustom/auto", "429", config);
       writeFileSync(
         join(codexHome, "auth.json"),
-        JSON.stringify({ tokens: { access_token: stored, account_id: "stored_main_acc" } }),
+        JSON.stringify({ tokens: { access_token: stored, refresh_token: "stored_main_refresh", account_id: "stored_main_acc" } }),
       );
 
       const server = await startOwnedServer();
@@ -1000,7 +1052,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
         expect(nativeAuth).toEqual([]);
         expect(response.status).toBe(401);
       } finally {
-        await server.stop(true);
+        await stopTrackedServer(server);
       }
     });
   });
@@ -1020,7 +1072,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
       expect(nativeAuth).toEqual(["Bearer caller-native-token"]);
       expect(routedAuth).toEqual([]);
     } finally {
-      await server.stop(true);
+      await stopTrackedServer(server);
     }
   });
 
@@ -1034,7 +1086,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
         saveConfig(config);
         writeFileSync(join(codexHome, "auth.json"), JSON.stringify({ tokens: {} }));
 
-        const server = startServer(0, { inspectNativeCodexOwnership });
+        const server = startTrackedServer(0, { inspectNativeCodexOwnership });
         try {
           const authHeaders = {
             "x-opencodex-api-key": ADMISSION_SECRET,
@@ -1050,7 +1102,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
           // failure inside its normal response envelope. The wire observation is authoritative.
           expect([200, 502]).toContain(status);
         } finally {
-          await server.stop(true);
+          await stopTrackedServer(server);
         }
       });
     });
@@ -1065,7 +1117,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
     saveConfig(config);
     writeFileSync(
       join(codexHome, "auth.json"),
-      JSON.stringify({ tokens: { access_token: stored, account_id: "stored_main_acc" } }),
+      JSON.stringify({ tokens: { access_token: stored, refresh_token: "stored_main_refresh", account_id: "stored_main_acc" } }),
     );
 
     const server = await startOwnedServer();
@@ -1074,7 +1126,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
       expect(response.status).toBe(200);
       expect(nativeAuth).toEqual([`Bearer ${stored}`]);
     } finally {
-      await server.stop(true);
+      await stopTrackedServer(server);
     }
   });
 
@@ -1087,7 +1139,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
     saveConfig(config);
     writeFileSync(
       join(codexHome, "auth.json"),
-      JSON.stringify({ tokens: { access_token: stored, account_id: "stored_main_acc" } }),
+      JSON.stringify({ tokens: { access_token: stored, refresh_token: "stored_main_refresh", account_id: "stored_main_acc" } }),
     );
 
     const server = await startOwnedServer();
@@ -1096,7 +1148,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
       expect(response.status).toBe(200);
       expect(nativeAuth).toEqual([`Bearer ${stored}`]);
     } finally {
-      await server.stop(true);
+      await stopTrackedServer(server);
     }
   });
 
@@ -1108,10 +1160,10 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
     saveConfig(config);
     writeFileSync(
       join(codexHome, "auth.json"),
-      JSON.stringify({ tokens: { access_token: liveJwt(), account_id: "stored_main_acc" } }),
+      JSON.stringify({ tokens: { access_token: liveJwt(), refresh_token: "stored_main_refresh", account_id: "stored_main_acc" } }),
     );
 
-    const server = startServer(0, {
+    const server = startTrackedServer(0, {
       inspectNativeCodexOwnership: () => ({ ownership: "foreign", reason: "fixture-owned by another service" }),
     });
     try {
@@ -1123,7 +1175,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
       expect(response.status).toBe(401);
       expect(nativeAuth).toEqual([]);
     } finally {
-      await server.stop(true);
+      await stopTrackedServer(server);
     }
   });
 
@@ -1137,6 +1189,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
           authMode: "forward",
           codexAccountMode: "direct",
           defaultModel: "gpt-5.6-luna",
+          upstreamWebsocket: false,
         };
         config.shadowCallIntercept = {
           enabled: true,
@@ -1146,7 +1199,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
         saveConfig(config);
         writeFileSync(join(codexHome, "auth.json"), JSON.stringify({ tokens: {} }));
 
-        const server = startServer(0, { inspectNativeCodexOwnership });
+        const server = startTrackedServer(0, { inspectNativeCodexOwnership });
         try {
           const authHeaders = {
             "x-opencodex-api-key": ADMISSION_SECRET,
@@ -1160,7 +1213,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
           expect(capturedAuth).toEqual([]);
           expect([200, 401, 502]).toContain(status);
         } finally {
-          await server.stop(true);
+          await stopTrackedServer(server);
         }
       });
     });
@@ -1170,7 +1223,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
     await withCursorCaptureServer(async (baseUrl, capturedAuth) => {
       saveConfig(cursorForwardConfig(baseUrl));
       writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
-        tokens: { access_token: liveJwt(), account_id: "stored_main_acc" },
+        tokens: { access_token: liveJwt(), refresh_token: "stored_main_refresh", account_id: "stored_main_acc" },
       }));
 
       const server = await startOwnedServer();
@@ -1179,7 +1232,7 @@ describe("bearer admission is not reused as a Cursor upstream credential", () =>
         expect(response.status).toBe(502);
         expect(capturedAuth).toEqual([]);
       } finally {
-        await server.stop(true);
+        await stopTrackedServer(server);
       }
     });
   });
@@ -1213,6 +1266,7 @@ describe("an admission bearer never reaches a canonical ChatGPT transport, whate
           baseUrl: "https://chatgpt.com/backend-api/codex",
           authMode: "forward",
           defaultModel: "gpt-5.5",
+          upstreamWebsocket: false,
         },
       },
     } as OcxConfig;
@@ -1222,7 +1276,7 @@ describe("an admission bearer never reaches a canonical ChatGPT transport, whate
     saveConfig(customNamedCanonicalConfig());
     writeFileSync(join(codexHome, "auth.json"), JSON.stringify({ tokens: {} }));
 
-    const server = startServer(0, { inspectNativeCodexOwnership });
+    const server = startTrackedServer(0, { inspectNativeCodexOwnership });
     try {
       await waitForNativeMainStartupGate();
       const response = await postResponses(server.url, "mirror/gpt-5.5");
@@ -1233,7 +1287,7 @@ describe("an admission bearer never reaches a canonical ChatGPT transport, whate
       expect(nativeAuth.join("|")).not.toContain(ADMISSION_SECRET);
       expect(response.status).not.toBe(200);
     } finally {
-      await server.stop(true);
+      await stopTrackedServer(server);
     }
   });
 
@@ -1242,10 +1296,10 @@ describe("an admission bearer never reaches a canonical ChatGPT transport, whate
     const stored = liveJwt();
     writeFileSync(
       join(codexHome, "auth.json"),
-      JSON.stringify({ tokens: { access_token: stored, account_id: "stored_main_acc" } }),
+      JSON.stringify({ tokens: { access_token: stored, refresh_token: "stored_main_refresh", account_id: "stored_main_acc" } }),
     );
 
-    const server = startServer(0, { inspectNativeCodexOwnership });
+    const server = startTrackedServer(0, { inspectNativeCodexOwnership });
     try {
       await waitForNativeMainStartupGate();
       await postResponses(server.url, "mirror/gpt-5.5");
@@ -1253,7 +1307,7 @@ describe("an admission bearer never reaches a canonical ChatGPT transport, whate
       expect(nativeAuth.join("|")).not.toContain(ADMISSION_SECRET);
       for (const sent of nativeAuth) expect(sent).toBe(`Bearer ${stored}`);
     } finally {
-      await server.stop(true);
+      await stopTrackedServer(server);
     }
   });
 
@@ -1262,10 +1316,10 @@ describe("an admission bearer never reaches a canonical ChatGPT transport, whate
     const stored = liveJwt();
     writeFileSync(
       join(codexHome, "auth.json"),
-      JSON.stringify({ tokens: { access_token: stored, account_id: "stored_main_acc" } }),
+      JSON.stringify({ tokens: { access_token: stored, refresh_token: "stored_main_refresh", account_id: "stored_main_acc" } }),
     );
 
-    const server = startServer(0, { inspectNativeCodexOwnership });
+    const server = startTrackedServer(0, { inspectNativeCodexOwnership });
     let drain: ReturnType<typeof acquireNativeMainProfileDrain> = null;
     try {
       await waitForNativeMainStartupGate();
@@ -1279,7 +1333,7 @@ describe("an admission bearer never reaches a canonical ChatGPT transport, whate
       expect(routedAuth).toHaveLength(0);
     } finally {
       drain?.release();
-      await server.stop(true);
+      await stopTrackedServer(server);
     }
   });
 
@@ -1288,7 +1342,7 @@ describe("an admission bearer never reaches a canonical ChatGPT transport, whate
     const stored = liveJwt();
     writeFileSync(
       join(codexHome, "auth.json"),
-      JSON.stringify({ tokens: { access_token: stored, account_id: "stored_main_acc" } }),
+      JSON.stringify({ tokens: { access_token: stored, refresh_token: "stored_main_refresh", account_id: "stored_main_acc" } }),
     );
     let signalUpstreamStarted!: () => void;
     const upstreamStarted = new Promise<void>((resolve) => { signalUpstreamStarted = resolve; });
@@ -1306,7 +1360,7 @@ describe("an admission bearer never reaches a canonical ChatGPT transport, whate
       return originalFetch(input, init);
     }) as typeof fetch;
 
-    const server = startServer(0, { inspectNativeCodexOwnership });
+    const server = startTrackedServer(0, { inspectNativeCodexOwnership });
     let pending: Promise<Response> | null = null;
     try {
       await waitForNativeMainStartupGate();
@@ -1350,7 +1404,7 @@ describe("an admission bearer never reaches a canonical ChatGPT transport, whate
     } finally {
       releaseUpstream();
       await pending?.catch(() => {});
-      await server.stop(true);
+      await stopTrackedServer(server);
     }
   });
 });

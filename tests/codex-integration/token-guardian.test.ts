@@ -170,7 +170,7 @@ describe("token guardian", () => {
     const mock = mockFetchOk(OK_TOKEN);
     writeConfig({
       tokenGuardian: { enabled: true, tickSeconds: 60, leadSeconds: 60 },
-      providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "pool", refreshPolicy: "proactive" } },
+      providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "pool", refreshPolicy: "proactive", upstreamWebsocket: false,} },
     });
     saveCodexAccountCredential("acct-1", {
       accessToken: "old", refreshToken: "rt", expiresAt: Date.now() + 5_000, chatgptAccountId: "cg-1",
@@ -183,7 +183,7 @@ describe("token guardian", () => {
   test.each(["response.completed", "response.failed"])("a late guardian probe cannot change a replacement pending credential (%s)", async terminal => {
     writeConfig({
       tokenGuardian: { enabled: true, codexWarmupEnabled: true, tickSeconds: 60, leadSeconds: 60 },
-      providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "pool", refreshPolicy: "proactive" } },
+      providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "pool", refreshPolicy: "proactive", upstreamWebsocket: false,} },
     });
     const credential = {
       accessToken: "original", refreshToken: "rt-original", expiresAt: Date.now() + 3600_000, chatgptAccountId: "cg-pending",
@@ -204,7 +204,7 @@ describe("token guardian", () => {
     const mock = mockWarmupFetch();
     writeConfig({
       tokenGuardian: { enabled: true, codexWarmupEnabled: true, tickSeconds: 60, leadSeconds: 60 },
-      providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "pool", refreshPolicy: "proactive" } },
+      providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "pool", refreshPolicy: "proactive", upstreamWebsocket: false,} },
     });
     const credential = {
       accessToken: "original", refreshToken: "rt-original", expiresAt: Date.now() + 3600_000, chatgptAccountId: "cg-pending",
@@ -222,7 +222,7 @@ describe("token guardian", () => {
     const mock = mockWarmupFetch();
     writeConfig({
       tokenGuardian: { enabled: true, codexWarmupEnabled: true, tickSeconds: 60, leadSeconds: 60 },
-      providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "pool", refreshPolicy: "proactive" } },
+      providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "pool", refreshPolicy: "proactive", upstreamWebsocket: false,} },
     });
     saveCodexAccountCredential("acct-pending", {
       accessToken: "pending", refreshToken: "rt-pending", expiresAt: Date.now() + 3600_000, chatgptAccountId: "cg-pending",
@@ -237,7 +237,7 @@ describe("token guardian", () => {
     const mock = mockWarmupFetch();
     writeConfig({
       tokenGuardian: { enabled: true, tickSeconds: 60, leadSeconds: 60 },
-      providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "pool", refreshPolicy: "proactive" } },
+      providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "pool", refreshPolicy: "proactive", upstreamWebsocket: false,} },
     });
     saveCodexAccountCredential("acct-stale", {
       accessToken: "old", refreshToken: "rt", expiresAt: Date.now() + 3600_000, chatgptAccountId: "cg-1",
@@ -257,7 +257,7 @@ describe("token guardian", () => {
         codexWarmupEnabled: true,
         codexWarmupMaxAgeSeconds: 60,
       },
-      providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "pool", refreshPolicy: "proactive" } },
+      providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "pool", refreshPolicy: "proactive", upstreamWebsocket: false,} },
     });
     saveCodexAccountCredential("acct-warm", {
       accessToken: "old", refreshToken: "rt", expiresAt: Date.now() + 3600_000, chatgptAccountId: "cg-1",
@@ -279,7 +279,7 @@ describe("token guardian", () => {
   test("a revoked refresh grant persists a terminal verdict even with warmup disabled", async () => {
     writeConfig({
       tokenGuardian: { enabled: true, tickSeconds: 60, leadSeconds: 60 },
-      providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "pool", refreshPolicy: "proactive" } },
+      providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "pool", refreshPolicy: "proactive", upstreamWebsocket: false,} },
     });
     saveCodexAccountCredential("acct-revoked", {
       accessToken: "old", refreshToken: "rt", expiresAt: Date.now() + 5_000, chatgptAccountId: "cg-1",
@@ -301,7 +301,7 @@ describe("token guardian", () => {
   test("a transient refresh failure leaves the stored verdict untouched", async () => {
     writeConfig({
       tokenGuardian: { enabled: true, tickSeconds: 60, leadSeconds: 60 },
-      providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "pool", refreshPolicy: "proactive" } },
+      providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "pool", refreshPolicy: "proactive", upstreamWebsocket: false,} },
     });
     saveCodexAccountCredential("acct-transient", {
       accessToken: "old", refreshToken: "rt", expiresAt: Date.now() + 5_000, chatgptAccountId: "cg-1",
@@ -324,7 +324,7 @@ describe("token guardian", () => {
   test("a credential replaced mid-refresh is not branded by the previous credential's failure", async () => {
     writeConfig({
       tokenGuardian: { enabled: true, tickSeconds: 60, leadSeconds: 60 },
-      providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "pool", refreshPolicy: "proactive" } },
+      providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "pool", refreshPolicy: "proactive", upstreamWebsocket: false,} },
     });
     saveCodexAccountCredential("acct-replaced", {
       accessToken: "old", refreshToken: "rt", expiresAt: Date.now() + 5_000, chatgptAccountId: "cg-1",
@@ -356,7 +356,7 @@ describe("token guardian", () => {
     const accountStore = join(tmp, "ocx", "codex-accounts.json");
     writeFileSync(accountStore, "invalid-added-store");
     writeFileSync(join(tmp, "codex", "auth.json"), JSON.stringify({
-      tokens: { access_token: "main-access", account_id: "main-chatgpt-id" },
+      tokens: { access_token: "main-access", refresh_token: "main-refresh", account_id: "main-chatgpt-id" },
     }));
     const mock = mockWarmupFetch();
     writeConfig({
@@ -366,7 +366,7 @@ describe("token guardian", () => {
         leadSeconds: 60,
         codexWarmupEnabled: true,
       },
-      providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "direct", refreshPolicy: "proactive" } },
+      providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "direct", refreshPolicy: "proactive", upstreamWebsocket: false,} },
     });
 
     const res = await guardianSweep(Date.now());
@@ -378,7 +378,7 @@ describe("token guardian", () => {
 
   test("main warmup owns native main through async work and defers while a switch fence is active", async () => {
     writeFileSync(join(tmp, "codex", "auth.json"), JSON.stringify({
-      tokens: { access_token: "main-owned", account_id: "main-owned-account" },
+      tokens: { access_token: "main-owned", refresh_token: "main-owned-refresh", account_id: "main-owned-account" },
     }));
     writeConfig({
       tokenGuardian: {
@@ -394,6 +394,7 @@ describe("token guardian", () => {
           authMode: "forward",
           codexAccountMode: "direct",
           refreshPolicy: "proactive",
+          upstreamWebsocket: false,
         },
       },
     });

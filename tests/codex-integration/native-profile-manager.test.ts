@@ -1,7 +1,8 @@
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, statSync, symlinkSync, truncateSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { atomicWriteFileAsync, type AtomicWriteAsyncHooks, type AtomicWriteAsyncIO } from "../../src/config/atomic-write";
 import { NativeProfileManager } from "../../src/codex/native-profile-manager";
 import {
   decryptNativeEnvelope,
@@ -15,15 +16,18 @@ import {
 } from "../../src/codex/native-profile-store";
 import { NativeProfileError, type NativeProfileKey, type NativeProfileKeyProvider } from "../../src/codex/native-profile-types";
 import { codexCredentialMutationEpoch } from "../../src/codex/credential-mutation-epoch";
+import { getNativeMainAuthMemory, observeNativeMainAuthFile, stopNativeMainCredentialWatchers } from "../../src/codex/native-main-credentials";
 import { COLD_SPAWN_WARMUP_HOOK_BUDGET_MS, warmModuleGraph } from "../helpers/cold-spawn-warmup";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { helperPath, repoRoot } from "../helpers/repo-root";
 import { BULK_DURABLE_IO_BUDGET_MS, INTERNAL_DEADLINE_MS, SPAWN_BUDGET_MS } from "../helpers/test-budget";
+import { captureAtomicWritePublicationEvidence, writeNativeMainAuthFileForTests } from "../helpers/native-main-auth";
 
 const nativeProfileLockChildPath = helperPath("native-profile-lock-child.ts");
 const roots: string[] = [];
 
 afterEach(() => {
+  stopNativeMainCredentialWatchers();
   for (const root of roots.splice(0)) removeTreeWithRetry(root);
 });
 
@@ -50,11 +54,54 @@ function envelope(accountId: string, marker: string): string {
   return ` {\n  \"auth_mode\": \"chatgpt\",\n  \"tokens\": {\n    \"id_token\": \"opaque-id-${marker}\",\n    \"access_token\": \"opaque-access-${marker}\",\n    \"refresh_token\": \"opaque-refresh-${marker}\",\n    \"account_id\": \"${accountId}\",\n    \"future_token_field\": \"preserve-${marker}\"\n  },\n  \"future_root_field\": { \"marker\": \"${marker}\" }\n}\n`;
 }
 
-async function atomic(path: string, content: string): Promise<void> {
+async function atomic(path: string, content: string, hooks?: AtomicWriteAsyncHooks): Promise<void> {
   mkdirSync(dirname(path), { recursive: true });
   const temp = `${path}.test.tmp`;
-  writeFileSync(temp, content, { mode: 0o600 });
-  renameSync(temp, path);
+  let publicationDescriptor: number | undefined;
+  try {
+    writeFileSync(temp, content, { mode: 0o600 });
+    await hooks?.beforeRename?.(path);
+    const tempStat = lstatSync(temp);
+    const tempEvidence = {
+      dev: Number(tempStat.dev),
+      ino: Number(tempStat.ino),
+      size: Number(tempStat.size),
+      mode: Number(tempStat.mode),
+      mtimeMs: Number(tempStat.mtimeMs),
+      ctimeMs: Number(tempStat.ctimeMs),
+    };
+    await hooks?.validateBeforeRename?.(path, tempEvidence);
+    if (hooks?.afterRenameEvidence) publicationDescriptor = openSync(temp, "r");
+    renameSync(temp, path);
+    if (publicationDescriptor !== undefined) {
+      await hooks?.afterRenameEvidence?.(path, captureAtomicWritePublicationEvidence(publicationDescriptor));
+    }
+    await hooks?.afterRename?.(path, tempEvidence);
+  } catch (error) {
+    try { unlinkSync(temp); } catch { /* The rename committed or the temp is already absent. */ }
+    throw error;
+  } finally {
+    if (publicationDescriptor !== undefined) closeSync(publicationDescriptor);
+  }
+}
+
+function nativeAuthWriteIO(
+  authPath: string,
+  writeContent: (content: string) => string | undefined = () => undefined,
+): AtomicWriteAsyncIO {
+  return {
+    write: (path, content) => {
+      const output = path.startsWith(`${authPath}.ocx.`) ? writeContent(content) ?? content : content;
+      writeFileSync(path, output, { mode: 0o600 });
+    },
+    harden: () => {},
+    rename: (source, destination, afterReplace) => {
+      renameSync(source, destination);
+      afterReplace?.();
+    },
+    truncate: path => truncateSync(path, 0),
+    unlink: path => unlinkSync(path),
+  };
 }
 
 function hasJournalPhase(content: string, phase: string): boolean {
@@ -114,15 +161,16 @@ async function leavePendingJournal(f: Awaited<ReturnType<typeof enrolledFixture>
   let authWrites = 0;
   const interrupted = new NativeProfileManager({
     ...f.options,
-    atomicWrite: async (path, content) => {
-      if (path === authPath) {
-        authWrites += 1;
-        if (authWrites > 1) throw new Error("injected restore failure");
-      }
+    nativeAuthWriteIO: nativeAuthWriteIO(authPath, content => {
+      authWrites += 1;
+      if (authWrites > 1) throw new Error("injected restore failure");
+      return undefined;
+    }),
+    atomicWrite: async (path, content, hooks) => {
       if (path === journalPath && hasJournalPhase(content, "auth-replaced")) {
         throw new Error("injected post-replacement failure");
       }
-      return atomic(path, content);
+      return atomic(path, content, hooks);
     },
   });
   let caught: unknown;
@@ -369,7 +417,7 @@ describe("native main profile transactions", () => {
     const originalVault = readFileSync(f.manager.context.vaultPath, "utf8");
     const malformed = "{cross-instance-malformed-journal\n";
     writeFileSync(f.manager.context.journalPath, malformed, { mode: 0o600 });
-    writeFileSync(f.manager.context.authPath, envelope("account-third", "third"), { mode: 0o600 });
+    writeNativeMainAuthFileForTests(f.manager.context.authPath, envelope("account-third", "third"));
 
     expect(probeNativeProfileRecoveryState(second.context)).toBe("journal");
     let caught: unknown;
@@ -383,7 +431,7 @@ describe("native main profile transactions", () => {
     expect(quarantine).toHaveLength(1);
     expect(readFileSync(join(f.manager.context.rootDir, quarantine[0]!), "utf8")).toBe(malformed);
 
-    writeFileSync(f.manager.context.authPath, originalAuth, { mode: 0o600 });
+    writeNativeMainAuthFileForTests(f.manager.context.authPath, originalAuth);
     expect(await f.manager.recover(false)).toMatchObject({ recovered: true, action: "confirm-current-owner" });
     expect(probeNativeProfileRecoveryState(second.context)).toBe("none");
   });
@@ -581,9 +629,9 @@ describe("native main profile transactions", () => {
     writeFileSync(join(stage.stagingCodexHome, "auth.json"), f.target);
     const failing = new NativeProfileManager({
       ...f.options,
-      atomicWrite: async (path, content) => {
+      atomicWrite: async (path, content, hooks) => {
         if (path === manager.context.vaultPath) throw new Error("injected vault failure");
-        return atomic(path, content);
+        return atomic(path, content, hooks);
       },
     });
 
@@ -631,16 +679,16 @@ describe("native main profile transactions", () => {
     const largeSource = JSON.parse(f.source) as Record<string, unknown>;
     largeSource.padding = "x".repeat(Math.floor(MAX_NATIVE_PROFILE_METADATA_BYTES * 0.85));
     const sourceText = JSON.stringify(largeSource, null, 2) + "\n";
-    writeFileSync(join(f.codexHome, "auth.json"), sourceText);
+    writeNativeMainAuthFileForTests(join(f.codexHome, "auth.json"), sourceText);
     let authWrites = 0;
     let vaultWrites = 0;
     let vaultPath: string | undefined;
     const manager = new NativeProfileManager({
       ...f.options,
-      atomicWrite: async (path, content) => {
+      atomicWrite: async (path, content, hooks) => {
         if (path === join(f.codexHome, "auth.json")) authWrites += 1;
         if (path === vaultPath) vaultWrites += 1;
-        return atomic(path, content);
+        return atomic(path, content, hooks);
       },
     });
     vaultPath = manager.context.vaultPath;
@@ -960,12 +1008,15 @@ describe("native main profile transactions", () => {
     let authWrites = 0;
     const interrupted = new NativeProfileManager({
       ...f.options,
-      atomicWrite: async (path, content) => {
-        if (path === authPath && authWrites++ > 0) throw new Error("injected restore failure");
+      nativeAuthWriteIO: nativeAuthWriteIO(authPath, content => {
+        if (authWrites++ > 0) throw new Error("injected restore failure");
+        return undefined;
+      }),
+      atomicWrite: async (path, content, hooks) => {
         if (path === journalPath && hasJournalPhase(content, "auth-replaced")) {
           throw new Error("injected post-replacement failure");
         }
-        return atomic(path, content);
+        return atomic(path, content, hooks);
       },
     });
     let interruptedError: unknown;
@@ -1008,7 +1059,7 @@ describe("native main profile transactions", () => {
     const f = await enrolledFixture();
     const malformed = "{malformed-journal\n";
     writeFileSync(f.manager.context.journalPath, malformed);
-    writeFileSync(f.manager.context.authPath, f.target);
+    writeNativeMainAuthFileForTests(f.manager.context.authPath, f.target);
     const authBefore = readFileSync(f.manager.context.authPath);
     const vaultBefore = readFileSync(f.manager.context.vaultPath);
     let caught: unknown;
@@ -1023,7 +1074,7 @@ describe("native main profile transactions", () => {
     const quarantine = readdirSync(f.manager.context.rootDir).filter(name => name.includes(".journal.quarantine-"));
     expect(quarantine).toHaveLength(1);
     expect(readFileSync(join(f.manager.context.rootDir, quarantine[0]!), "utf8")).toBe(malformed);
-    writeFileSync(f.manager.context.authPath, f.source);
+    writeNativeMainAuthFileForTests(f.manager.context.authPath, f.source);
     expect(await f.manager.recover(false)).toMatchObject({
       recovered: true,
       action: "confirm-current-owner",
@@ -1061,7 +1112,7 @@ describe("native main profile transactions", () => {
     await leavePendingJournal(f);
     const epochBefore = codexCredentialMutationEpoch();
     const refreshed = envelope("account-target", "target-refreshed-auto");
-    writeFileSync(f.manager.context.authPath, refreshed);
+    writeNativeMainAuthFileForTests(f.manager.context.authPath, refreshed);
     expect(await f.manager.recover(false)).toMatchObject({
       recovered: true,
       action: "commit-target",
@@ -1069,7 +1120,7 @@ describe("native main profile transactions", () => {
       restartRequired: true,
     });
     expect(readFileSync(f.manager.context.authPath, "utf8")).toBe(refreshed);
-    expect(codexCredentialMutationEpoch()).toBe(epochBefore);
+    expect(codexCredentialMutationEpoch()).toBe(epochBefore + 1);
   });
 
   // The manager can spend up to 5 s acquiring its SQLite transaction lock.
@@ -1109,46 +1160,50 @@ describe("native main profile transactions", () => {
   // transaction test above. Hosted macOS can complete the product recovery
   // successfully after Bun's 5 s default, so the harness must not become the
   // shorter deadline.
-  test("a read-back mismatch restores the exact source and removes the journal", async () => {
+  test("rollback over an invalid auth observation retains the journal and requires recovery", async () => {
     const f = await enrolledFixture();
     const authPath = f.manager.context.authPath;
     let authWrites = 0;
     const failing = new NativeProfileManager({
       ...f.options,
-      atomicWrite: async (path, content) => {
-        if (path === authPath && authWrites++ === 0) return atomic(path, "{}\n");
-        return atomic(path, content);
+      nativeAuthWriteIO: nativeAuthWriteIO(authPath, content => {
+        if (authWrites++ === 0) return "{}\n";
+        return content;
+      }),
+      atomicWrite: async (path, content, hooks) => {
+        return atomic(path, content, hooks);
       },
     });
     const epochBefore = codexCredentialMutationEpoch();
     let caught: unknown;
     try { await failing.switch("work", true); } catch (error) { caught = error; }
     expect(caught).toBeInstanceOf(NativeProfileError);
-    expect((caught as NativeProfileError).code).toBe("SWITCH_ROLLED_BACK");
-    expect(readFileSync(join(f.codexHome, "auth.json"), "utf8")).toBe(f.source);
-    expect((await failing.doctor()).recoveryPending).toBe(false);
+    expect((caught as NativeProfileError).code).toBe("RECOVERY_REQUIRED");
+    expect(readFileSync(join(f.codexHome, "auth.json"), "utf8")).toBe("{}\n");
+    expect((await failing.doctor()).recoveryPending).toBe(true);
     expect((await failing.list()).activeProfileId).toBe(f.sourceProfile.id);
-    expect(codexCredentialMutationEpoch()).toBe(epochBefore + 1);
+    expect(codexCredentialMutationEpoch()).toBe(epochBefore);
   }, 10_000);
 
-  test("rollback verification failure retains the encrypted recovery journal and never claims success", async () => {
+  test("invalid auth during switch retains the encrypted journal and requires recovery", async () => {
     const f = await enrolledFixture();
     const authPath = f.manager.context.authPath;
     let authWrites = 0;
     const failing = new NativeProfileManager({
       ...f.options,
-      atomicWrite: async (path, content) => {
-        if (path === authPath) {
-          authWrites += 1;
-          if (authWrites <= 2) return atomic(path, "{}\n");
-        }
-        return atomic(path, content);
+      nativeAuthWriteIO: nativeAuthWriteIO(authPath, content => {
+        if (authWrites++ < 2) return "{}\n";
+        return content;
+      }),
+      atomicWrite: async (path, content, hooks) => {
+        return atomic(path, content, hooks);
       },
     });
     let caught: unknown;
     try { await failing.switch("work", true); } catch (error) { caught = error; }
     expect(caught).toBeInstanceOf(NativeProfileError);
-    expect((caught as NativeProfileError).code).toBe("AUTH_RESTORE_FAILED");
+    expect((caught as NativeProfileError).code).toBe("RECOVERY_REQUIRED");
+    expect(readFileSync(authPath, "utf8")).toBe("{}\n");
     expect((await failing.doctor()).recoveryPending).toBe(true);
     const journal = readFileSync(failing.context.journalPath, "utf8");
     expect(journal).not.toContain("opaque-refresh-source");
@@ -1174,14 +1229,74 @@ describe("native main profile transactions", () => {
     expect((await blocked.list()).activeProfileId).toBe(f.sourceProfile.id);
   }, 10_000);
 
+  test("profile registration rejects a symlinked main auth file", async () => {
+    const f = fixture();
+    const authPath = join(f.codexHome, "auth.json");
+    const linkedPath = join(f.root, "linked-main-auth.json");
+    writeFileSync(linkedPath, f.source);
+    unlinkSync(authPath);
+    symlinkSync(linkedPath, authPath);
+    const manager = new NativeProfileManager(f.options);
+    let caught: unknown;
+    try { await manager.register("personal"); } catch (error) { caught = error; }
+    expect(caught).toBeInstanceOf(NativeProfileError);
+    expect((caught as NativeProfileError).code).toBe("AUTH_UNREADABLE");
+    expect(lstatSync(authPath).isSymbolicLink()).toBe(true);
+    expect(readFileSync(linkedPath, "utf8")).toBe(f.source);
+    expect(existsSync(manager.context.vaultPath)).toBe(false);
+  });
+
+  test("profile registration rejects a link after retaining a warm regular snapshot", async () => {
+    const f = fixture();
+    const authPath = join(f.codexHome, "auth.json");
+    const linkedPath = join(f.root, "linked-invalid-main-auth.json");
+    const warm = getNativeMainAuthMemory(authPath);
+    warm.snapshot?.raw.fill(0);
+    warm.raw?.fill(0);
+    writeFileSync(linkedPath, "{\"auth_mode\":\"chatgpt\",\"tokens\":{\"access_token\":\"partial\"}}\n");
+    unlinkSync(authPath);
+    symlinkSync(linkedPath, authPath);
+
+    const observation = observeNativeMainAuthFile(authPath);
+    expect(observation.fileStatus).toBe("invalid");
+    expect(observation.isSymlink).toBe(true);
+    expect(observation.snapshot?.isSymlink).toBe(false);
+    observation.raw?.fill(0);
+    observation.snapshot?.raw.fill(0);
+
+    const manager = new NativeProfileManager(f.options);
+    let caught: unknown;
+    try { await manager.register("personal"); } catch (error) { caught = error; }
+    expect(caught).toBeInstanceOf(NativeProfileError);
+    expect((caught as NativeProfileError).code).toBe("AUTH_UNREADABLE");
+    expect(existsSync(manager.context.vaultPath)).toBe(false);
+  });
+
+  test("profile writability check rejects a symlinked main auth file before journaling", async () => {
+    const f = await enrolledFixture();
+    const authPath = f.manager.context.authPath;
+    const linkedPath = join(f.root, "linked-main-auth.json");
+    writeFileSync(linkedPath, f.source);
+    unlinkSync(authPath);
+    symlinkSync(linkedPath, authPath);
+    const manager = new NativeProfileManager(f.options);
+    let caught: unknown;
+    try { await manager.switch("work", true); } catch (error) { caught = error; }
+    expect(caught).toBeInstanceOf(NativeProfileError);
+    expect((caught as NativeProfileError).code).toBe("AUTH_UNREADABLE");
+    expect(lstatSync(authPath).isSymbolicLink()).toBe(true);
+    expect(readFileSync(linkedPath, "utf8")).toBe(f.source);
+    expect(existsSync(manager.context.journalPath)).toBe(false);
+  }, 10_000);
+
   test("vault-write failure after auth replacement restores exact source and removes the journal", async () => {
     const f = await enrolledFixture();
     let vaultWrites = 0;
     const failing = new NativeProfileManager({
       ...f.options,
-      atomicWrite: async (path, content) => {
+      atomicWrite: async (path, content, hooks) => {
         if (path === f.manager.context.vaultPath && vaultWrites++ === 0) throw new Error("injected switch vault failure");
-        return atomic(path, content);
+        return atomic(path, content, hooks);
       },
     });
     let caught: unknown;
@@ -1193,6 +1308,109 @@ describe("native main profile transactions", () => {
     expect((await failing.list()).activeProfileId).toBe(f.sourceProfile.id);
   });
 
+  test("an observed identical-byte replacement after target publication keeps recovery journal", async () => {
+    const f = await enrolledFixture();
+    const authPath = f.manager.context.authPath;
+    let externalIdentity: { dev: number; ino: number } | undefined;
+    let replacementObserved = false;
+    const failing = new NativeProfileManager({
+      ...f.options,
+      atomicWrite: async (path, content, hooks) => {
+        await atomic(path, content, hooks);
+      },
+      onSwitchBoundary: boundary => {
+        if (boundary !== "auth-replaced" || replacementObserved) return;
+        const replacementPath = `${authPath}.codex-replacement`;
+        writeFileSync(replacementPath, f.target, { mode: 0o600 });
+        renameSync(replacementPath, authPath);
+        const replacementStat = lstatSync(authPath);
+        externalIdentity = { dev: Number(replacementStat.dev), ino: Number(replacementStat.ino) };
+        const observation = observeNativeMainAuthFile(authPath);
+        observation.raw?.fill(0);
+        observation.snapshot?.raw.fill(0);
+        replacementObserved = true;
+        throw new Error("injected later transaction failure");
+      },
+    });
+
+    let caught: unknown;
+    try { await failing.switch("work", true); } catch (error) { caught = error; }
+
+    expect(replacementObserved).toBe(true);
+    expect(caught).toBeInstanceOf(NativeProfileError);
+    expect((caught as NativeProfileError).code).toBe("RECOVERY_REQUIRED");
+    const currentStat = lstatSync(authPath);
+    expect({ dev: Number(currentStat.dev), ino: Number(currentStat.ino) }).toEqual(externalIdentity);
+    expect(readFileSync(authPath, "utf8")).toBe(f.target);
+    expect(existsSync(failing.context.journalPath)).toBe(true);
+    expect((await failing.list()).activeProfileId).toBe(f.sourceProfile.id);
+  });
+
+  test("a ctime-only rewrite after the first descriptor sample keeps the valid target and recovery journal", async () => {
+    const f = await enrolledFixture();
+    const authPath = f.manager.context.authPath;
+    let authWrites = 0;
+    let successfulAuthReceipts = 0;
+    let rollbackAttempts = 0;
+    let rewrittenAfterRename = false;
+    let ctimeOnlyRewriteObserved = false;
+    let switchBoundaryReached = false;
+    const stagedAuthBytes = new Map<string, string>();
+    const fixedMtime = new Date(1_700_000_000_000);
+    const ctimeAfterSampleIO: AtomicWriteAsyncIO = {
+      write: (tempPath, content) => {
+        if (tempPath.startsWith(`${authPath}.ocx.`)) {
+          authWrites++;
+          if (authWrites > 1) rollbackAttempts++;
+          stagedAuthBytes.set(tempPath, content);
+        }
+        writeFileSync(tempPath, content, { mode: 0o600 });
+        if (authWrites === 1) utimesSync(tempPath, fixedMtime, fixedMtime);
+      },
+      harden: () => {},
+      rename: (source, destination, afterReplace) => {
+        renameSync(source, destination);
+        afterReplace?.();
+        if (destination !== authPath || authWrites !== 1) return;
+        const content = stagedAuthBytes.get(source);
+        if (content === undefined) throw new Error("native auth staging payload was missing");
+        const renamedStat = statSync(destination);
+        writeFileSync(destination, content);
+        utimesSync(destination, fixedMtime, fixedMtime);
+        const rewrittenStat = statSync(destination);
+        ctimeOnlyRewriteObserved = rewrittenStat.mtimeMs === renamedStat.mtimeMs
+          && rewrittenStat.ctimeMs > renamedStat.ctimeMs;
+        rewrittenAfterRename = true;
+      },
+      truncate: path => truncateSync(path, 0),
+      unlink: path => unlinkSync(path),
+    };
+    const manager = new NativeProfileManager({
+      ...f.options,
+      nativeAuthWriteIO: ctimeAfterSampleIO,
+      onSwitchBoundary: boundary => {
+        if (boundary === "auth-replaced") {
+          switchBoundaryReached = true;
+          successfulAuthReceipts++;
+          throw new Error("injected failure after the target receipt");
+        }
+      },
+    });
+
+    let caught: unknown;
+    try { await manager.switch("work", true); } catch (error) { caught = error; }
+
+    expect(rewrittenAfterRename).toBe(true);
+    expect(ctimeOnlyRewriteObserved).toBe(true);
+    expect(caught).toBeInstanceOf(NativeProfileError);
+    expect((caught as NativeProfileError).code).toBe("RECOVERY_REQUIRED");
+    expect(switchBoundaryReached).toBe(false);
+    expect(successfulAuthReceipts).toBe(0);
+    expect(rollbackAttempts).toBe(0);
+    expect(readFileSync(authPath, "utf8")).toBe(f.target);
+    expect(existsSync(manager.context.journalPath)).toBe(true);
+  });
+
   test("explicit rollback recovery applies the native Codex process guard", async () => {
     const f = await enrolledFixture();
     const authPath = f.manager.context.authPath;
@@ -1200,15 +1418,16 @@ describe("native main profile transactions", () => {
     let authWrites = 0;
     const interrupted = new NativeProfileManager({
       ...f.options,
-      atomicWrite: async (path, content) => {
-        if (path === authPath) {
-          authWrites += 1;
-          if (authWrites > 1) throw new Error("injected restore failure");
-        }
+      nativeAuthWriteIO: nativeAuthWriteIO(authPath, content => {
+        authWrites += 1;
+        if (authWrites > 1) throw new Error("injected restore failure");
+        return undefined;
+      }),
+      atomicWrite: async (path, content, hooks) => {
         if (path === journalPath && hasJournalPhase(content, "auth-replaced")) {
           throw new Error("injected post-replacement failure");
         }
-        return atomic(path, content);
+        return atomic(path, content, hooks);
       },
     });
     let switchError: unknown;
@@ -1292,8 +1511,8 @@ describe("native main profile transactions", () => {
     const f = await enrolledFixture();
     await leavePendingJournal(f);
     const refreshedTarget = envelope("account-target", "target-refreshed");
-    writeFileSync(f.manager.context.authPath, refreshedTarget);
     const epochBefore = codexCredentialMutationEpoch();
+    writeNativeMainAuthFileForTests(f.manager.context.authPath, refreshedTarget);
 
     const result = await f.manager.recover(true, true);
 
@@ -1319,20 +1538,20 @@ describe("native main profile transactions", () => {
     );
     try { expect(decrypted.text).toBe(refreshedTarget); } finally { decrypted.raw.fill(0); key!.key.fill(0); }
     expect(f.transitions).toEqual(["account-target->account-source"]);
-    expect(codexCredentialMutationEpoch()).toBe(epochBefore + 1);
+    expect(codexCredentialMutationEpoch()).toBe(epochBefore + 2);
   });
 
   test("rollback preservation failure leaves refreshed target auth untouched and journaled", async () => {
     const f = await enrolledFixture();
     await leavePendingJournal(f);
     const refreshedTarget = envelope("account-target", "target-refreshed-failure");
-    writeFileSync(f.manager.context.authPath, refreshedTarget);
+    writeNativeMainAuthFileForTests(f.manager.context.authPath, refreshedTarget);
     const vaultBefore = readFileSync(f.manager.context.vaultPath, "utf8");
     const failing = new NativeProfileManager({
       ...f.options,
-      atomicWrite: async (path, content) => {
+      atomicWrite: async (path, content, hooks) => {
         if (path === f.manager.context.vaultPath) throw new Error("injected rollback vault failure");
-        return atomic(path, content);
+        return atomic(path, content, hooks);
       },
     });
 
@@ -1370,7 +1589,7 @@ describe("native main profile transactions", () => {
     const f = await enrolledFixture();
     const captured: NativeEnvelopeSnapshot[] = [];
     const manager = new NativeProfileManager({ ...f.options, readEnvelope: captureEnvelopes(captured) });
-    writeFileSync(f.manager.context.authPath, f.target);
+    writeNativeMainAuthFileForTests(f.manager.context.authPath, f.target);
 
     let caught: unknown;
     try { await manager.prepareStage(); } catch (error) { caught = error; }
@@ -1401,7 +1620,7 @@ describe("native main profile transactions", () => {
     const f = await enrolledFixture();
     await leavePendingJournal(f);
     const issuedBefore = f.keyProvider.issuedKeys.length;
-    writeFileSync(f.manager.context.authPath, "{}\n");
+    writeNativeMainAuthFileForTests(f.manager.context.authPath, "{}\n");
 
     let caught: unknown;
     try { await f.manager.recover(true, true); } catch (error) { caught = error; }

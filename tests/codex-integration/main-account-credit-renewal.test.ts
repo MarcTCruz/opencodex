@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { writeNativeMainAuthFileForTests } from "../helpers/native-main-auth";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -42,7 +43,7 @@ function bearer(id = accountId, expired = false): string {
 }
 
 function writeMain(id = accountId, expired = false): void {
-  writeFileSync(join(home, "auth.json"), JSON.stringify({ tokens: {
+  writeNativeMainAuthFileForTests(join(home, "auth.json"), JSON.stringify({ tokens: {
     access_token: bearer(id, expired), refresh_token: "fixture-refresh", account_id: id,
   } }));
   reconcileMainCodexAccountRuntimeState();
@@ -123,6 +124,7 @@ beforeEach(() => {
     activeCodexAccountId: MAIN, creditCodexAccountIds: [MAIN], codexAccounts: [], providers: { openai: {
       adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex",
       authMode: "forward", codexAccountMode: "pool",
+      upstreamWebsocket: false,
     } } };
   seed();
   fetchWith(async () => usage());

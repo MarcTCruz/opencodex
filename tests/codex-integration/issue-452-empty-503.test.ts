@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync} from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { saveCodexAccountCredential } from "../../src/codex/account-store";
 import { clearAccountNeedsReauth, clearAccountQuota, updateAccountQuota } from "../../src/codex/auth-api";
@@ -23,8 +24,36 @@ const previousApiToken = process.env.OPENCODEX_API_AUTH_TOKEN;
 const previousOpencodexHome = process.env.OPENCODEX_HOME;
 const previousOcxDebug = process.env.OCX_DEBUG;
 const originalGlobalFetch = globalThis.fetch;
-const TEST_DIR = join(import.meta.dir, ".tmp-issue-452-empty-503");
 let isolatedCodexHome: IsolatedCodexHome | null = null;
+let opencodexHomes: string[] = [];
+type CaseServer = { stop(closeActive?: boolean): void | Promise<void> };
+const acquiredServers = new Set<CaseServer>();
+
+function trackCaseServer<T extends CaseServer>(server: T): T {
+  acquiredServers.add(server);
+  return server;
+}
+
+function startTrackedServer(...args: Parameters<typeof startServer>): ReturnType<typeof startServer> {
+  return trackCaseServer(startServer(...args));
+}
+
+function startTrackedUpstream(options: Parameters<typeof Bun.serve>[0]): ReturnType<typeof Bun.serve> {
+  return trackCaseServer(Bun.serve(options));
+}
+
+async function stopCaseServer(server: CaseServer): Promise<void> {
+  if (!acquiredServers.has(server)) return;
+  await server.stop(true);
+  acquiredServers.delete(server);
+}
+
+function createOpencodexHome(): string {
+  const path = mkdtempSync(join(tmpdir(), "ocx-issue-452-"));
+  opencodexHomes.push(path);
+  process.env.OPENCODEX_HOME = path;
+  return path;
+}
 
 function redirectCanonicalCodexTo(baseUrl: string): void {
   globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
@@ -40,13 +69,30 @@ function redirectCanonicalCodexTo(baseUrl: string): void {
 }
 
 beforeEach(() => {
+  if (globalThis.fetch !== originalGlobalFetch) throw new Error("SETUP: fetch must be restored before issue-452 cases");
+  if (opencodexHomes.length !== 0) throw new Error("SETUP: issue-452 config homes must be removed before each case");
+  if (isolatedCodexHome !== null) throw new Error("SETUP: the isolated Codex home must be restored before each case");
+  if (process.env.OPENCODEX_HOME !== previousOpencodexHome
+    || process.env.OPENCODEX_API_AUTH_TOKEN !== previousApiToken
+    || process.env.OCX_DEBUG !== previousOcxDebug) {
+    throw new Error("SETUP: issue-452 environment must be restored before each case");
+  }
   isolatedCodexHome = installIsolatedCodexHome("ocx-issue-452-");
   resetDebugSettingsForTests();
   resetDebugLogBufferForTests();
   setDraining(false);
 });
 
-afterEach(() => {
+afterEach(async () => {
+  let stopError: unknown;
+  for (const server of [...acquiredServers]) {
+    try {
+      await server.stop(true);
+    } catch (error) {
+      stopError ??= error;
+    }
+  }
+  acquiredServers.clear();
   globalThis.fetch = originalGlobalFetch;
   setDraining(false);
   if (previousApiToken === undefined) delete process.env.OPENCODEX_API_AUTH_TOKEN;
@@ -63,7 +109,11 @@ afterEach(() => {
   clearThreadAccountMap();
   clearAccountNeedsReauth("pool-a");
   clearAccountQuota();
-  if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
+  for (const home of opencodexHomes) {
+    if (existsSync(home)) removeTreeWithRetry(home);
+  }
+  opencodexHomes = [];
+  if (stopError) throw stopError;
 });
 
 describe("formatPassthroughUpstreamError (#452)", () => {
@@ -191,16 +241,14 @@ async function withPoolPassthrough(
   reply: (request: Request) => Response | Promise<Response>,
   run: (serverUrl: string) => Promise<void>,
 ): Promise<void> {
-  if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
-  mkdirSync(TEST_DIR, { recursive: true });
-  process.env.OPENCODEX_HOME = TEST_DIR;
+  createOpencodexHome();
   delete process.env.OPENCODEX_API_AUTH_TOKEN;
   clearCodexUpstreamHealth();
   clearThreadAccountMap();
   clearAccountQuota();
   clearAccountNeedsReauth("pool-a");
 
-  const upstream = Bun.serve({
+  const upstream = startTrackedUpstream({
     port: 0,
     fetch(request) {
       return reply(request);
@@ -218,6 +266,7 @@ async function withPoolPassthrough(
         baseUrl: "https://chatgpt.com/backend-api/codex",
         authMode: "forward",
         codexAccountMode: "pool",
+        upstreamWebsocket: false,
       },
     },
     codexAccounts: [
@@ -234,12 +283,12 @@ async function withPoolPassthrough(
   });
   updateAccountQuota("pool-a", 10);
 
-  const server = startServer(0);
+  const server = startTrackedServer(0);
   try {
     await run(server.url.toString());
   } finally {
-    await server.stop(true);
-    await upstream.stop(true);
+    await stopCaseServer(server);
+    await stopCaseServer(upstream);
   }
 }
 
@@ -350,9 +399,7 @@ describe("passthrough empty 503 (#452)", () => {
 
 describe("drain 503 JSON (#452)", () => {
   test("POST /v1/responses while draining returns retryable JSON with listener-policy CORS (#6642)", async () => {
-    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
-    mkdirSync(TEST_DIR, { recursive: true });
-    process.env.OPENCODEX_HOME = TEST_DIR;
+    createOpencodexHome();
     process.env.OPENCODEX_API_AUTH_TOKEN = "drain-test-token";
     const loopbackPort = await findAvailablePort(0, "127.0.0.1");
     const publicPort = await findAvailablePort(0, "0.0.0.0", { reservedPort: loopbackPort });
@@ -371,7 +418,7 @@ describe("drain 503 JSON (#452)", () => {
       },
     } as OcxConfig);
 
-    const server = startServer(publicPort);
+    const server = startTrackedServer(publicPort);
     try {
       setDraining(true);
       for (const port of [server.port, loopbackPort]) {
@@ -397,7 +444,7 @@ describe("drain 503 JSON (#452)", () => {
       }
     } finally {
       setDraining(false);
-      await server.stop(true);
+      await stopCaseServer(server);
     }
   }, SERVER_BUDGET_MS);
 });

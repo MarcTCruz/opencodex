@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fetchMainAccountInfo } from "../../src/codex/auth-api";
@@ -18,7 +18,14 @@ import {
 } from "../../src/codex/reserve-availability";
 import { flushConfigDirHardeningForTests } from "../../src/config/paths";
 import { resetLifecycleDrainStateForTests } from "../../src/server/lifecycle";
+import {
+  initializeNativeMainStartupGate,
+  nativeMainStartupGateSnapshot,
+} from "../../src/codex/native-profile-startup";
+import { stopNativeMainCredentialWatchers } from "../../src/codex/native-main-credentials";
+import { resetOptionalShutdownHooksForTests } from "../../src/lib/optional-shutdown-hooks";
 import { setAsyncIcaclsRunnerForTests, setIcaclsRunnerForTests } from "../../src/lib/windows-secret-acl";
+import { writeNativeMainAuthFileForTests } from "../helpers/native-main-auth";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 
 const ACCOUNT = "fixture-passive-reserve-main";
@@ -35,9 +42,9 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-function writeCredential(accessToken: string): void {
-  writeFileSync(join(directory, "auth.json"), JSON.stringify({ tokens: {
-    access_token: accessToken, account_id: ACCOUNT,
+function writeCredential(directory: string, accessToken: string): void {
+  writeNativeMainAuthFileForTests(join(directory, "auth.json"), JSON.stringify({ tokens: {
+    access_token: accessToken, refresh_token: `${accessToken}-refresh`, account_id: ACCOUNT,
   } }));
 }
 
@@ -48,11 +55,15 @@ function ordinaryResponse(): Response {
   });
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  stopNativeMainCredentialWatchers();
+  resetOptionalShutdownHooksForTests();
+  resetLifecycleDrainStateForTests();
   previousHome = process.env.OPENCODEX_HOME;
   previousCodexHome = process.env.CODEX_HOME;
   previousFetch = globalThis.fetch;
   directory = mkdtempSync(join(tmpdir(), "ocx-reserve-passive-"));
+  expect(readdirSync(directory)).toEqual([]);
   process.env.OPENCODEX_HOME = directory;
   process.env.CODEX_HOME = directory;
   clearAccountQuota();
@@ -63,6 +74,9 @@ beforeEach(() => {
   const aclOk = { success: true, exitCode: 0, timedOut: false, stdout: "" };
   setIcaclsRunnerForTests(() => aclOk);
   setAsyncIcaclsRunnerForTests(async () => aclOk);
+  const startup = await initializeNativeMainStartupGate();
+  expect(startup.status).toBe("ready");
+  expect(startup).toEqual(nativeMainStartupGateSnapshot());
 });
 
 afterEach(async () => {
@@ -72,6 +86,8 @@ afterEach(async () => {
   clearMainAccountInfoCache();
   resetMainCodexAccountIdentityTrackingForTests();
   resetLifecycleDrainStateForTests();
+  stopNativeMainCredentialWatchers();
+  resetOptionalShutdownHooksForTests();
   setMainAccountPlan(null);
   try {
     await flushConfigDirHardeningForTests();
@@ -83,12 +99,16 @@ afterEach(async () => {
     if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = previousCodexHome;
     removeTreeWithRetry(directory);
+    await initializeNativeMainStartupGate({
+      manager: { context: { homeId: null } } as never,
+      probeRecoveryState: () => "none",
+    });
   }
 });
 
 describe("passive WHAM Reserve revocation producer", () => {
   test.each([false, true])("late A cannot revoke the new grant after token replacement, return to A=%s", async returnToA => {
-    writeCredential(TOKEN_A);
+    writeCredential(directory, TOKEN_A);
     const started = deferred<void>();
     const delayed = deferred<Response>();
     let passiveCalls = 0;
@@ -123,9 +143,9 @@ describe("passive WHAM Reserve revocation producer", () => {
       const oldWriter = captureMainQuotaWriter(ACCOUNT);
       const oldEpoch = getMainQuotaCredentialGeneration();
       expect(oldWriter).toBeDefined();
-      writeCredential(TOKEN_B);
+      writeCredential(directory, TOKEN_B);
       observeMainQuotaCredential(TOKEN_B, ACCOUNT);
-      if (returnToA) writeCredential(TOKEN_A);
+      if (returnToA) writeCredential(directory, TOKEN_A);
       const writer = observeMainQuotaCredential(currentToken, ACCOUNT);
       expect(writer).toEqual(oldWriter); // Workspace identity did not change.
       expect(getMainQuotaCredentialGeneration()).toBeGreaterThan(oldEpoch);

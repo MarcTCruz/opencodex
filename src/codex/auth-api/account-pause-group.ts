@@ -7,7 +7,8 @@ import { linkedCodexAccountIds } from "../account-identity";
 import { resolveCodexHomeDir } from "../home";
 import { tryAcquireNativeMainProfileClaim } from "../native-main-admission";
 import { withNativeMainSharedClaim } from "../native-main-claim";
-import { MAX_AUTH_BYTES, readBounded, resolveNativeProfileContext } from "../native-profile-store";
+import { resolveNativeProfileContext } from "../native-profile-store";
+import { getNativeMainAuthMemory } from "../native-main-credentials";
 import { NativeProfileError } from "../native-profile-types";
 import { isNativeMainClaimUnavailable, nativeMainProfileBusyResponse } from "./http";
 
@@ -17,8 +18,10 @@ type MainAuth = CodexTokenReadResult | { status: "api-key-only" };
 function readMainAuth(authPath: string): MainAuth {
   const main = readCodexTokensResult(authPath, { bounded: true });
   if (main.status !== "invalid") return main;
+  const observation = getNativeMainAuthMemory(authPath);
+  if (observation.status !== "ok" || !observation.snapshot) return main;
   try {
-    const j: unknown = JSON.parse(readBounded(authPath, MAX_AUTH_BYTES).toString("utf-8"));
+    const j: unknown = JSON.parse(observation.snapshot.raw.toString("utf-8"));
     if (j === null || typeof j !== "object" || Array.isArray(j)) return main;
     const envelope = j as { auth_mode?: unknown; OPENAI_API_KEY?: unknown; tokens?: unknown };
     const apiKeyOnly = envelope.tokens == null
@@ -27,6 +30,9 @@ function readMainAuth(authPath: string): MainAuth {
     return apiKeyOnly ? { status: "api-key-only" } : main;
   } catch {
     return main;
+  } finally {
+    observation.snapshot.raw.fill(0);
+    observation.raw?.fill(0);
   }
 }
 

@@ -1,4 +1,5 @@
 import { registerWarmupRateLimitCases } from "../helpers/codex-warmup-rate-limit";
+import { writeNativeMainAuthFileForTests, writeNativeMainAuthTokensForTests } from "../helpers/native-main-auth";
 import { registerResetCreditConsumeValidationTests } from "../helpers/reset-credit-consume-validation";
 import { registerPoolReauthCauseCases } from "../helpers/pool-reauth-cause";
 import * as usageHistoryModule from "../../src/usage/log";
@@ -283,8 +284,8 @@ function seedPoolAccount(
 describe("main quota refresh diagnostics", () => {
   function writeMain(accountId = "fixture-account"): string {
     const accessToken = jwtWithExp(Math.floor(Date.now() / 1000) + 3600);
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: accessToken, account_id: accountId },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: accessToken, refresh_token: "fixture-main-refresh", account_id: accountId },
     }));
     return accessToken;
   }
@@ -514,9 +515,9 @@ describe("main quota refresh diagnostics", () => {
     let reads = 0;
     globalThis.fetch = (async () => {
       reads++;
-      writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
         tokens: { access_token: jwtWithExp(Math.floor(Date.now() / 1000) + 3600),
-          account_id: `replacement-${reads}` },
+          refresh_token: "fixture-main-refresh", account_id: `replacement-${reads}` },
       }));
       return Response.json({ rate_limit: { primary_window: { used_percent: 37 } } });
     }) as typeof fetch;
@@ -598,8 +599,8 @@ afterEach(async () => {
 
 describe("codex-auth API", () => {
   test("account polling owns native main through publication so switch and rollback wait", async () => {
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "main-poll-owned", account_id: "acct-main-poll-owned" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "main-poll-owned", refresh_token: "fixture-main-refresh", account_id: "acct-main-poll-owned" },
     }));
 
     for (const scenario of [
@@ -677,8 +678,8 @@ describe("codex-auth API", () => {
   });
 
   test("account list discards a main snapshot invalidated while pool publication is pending", async () => {
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "main-generation", account_id: "acct-main-generation" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "main-generation", refresh_token: "fixture-main-refresh", account_id: "acct-main-generation" },
     }));
     const config = makeConfig();
     seedPoolAccount(config, {
@@ -731,8 +732,8 @@ describe("codex-auth API", () => {
   });
 
   test("account list preserves only the last claim-owned credential snapshot while main is fenced", async () => {
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "main-snapshot", account_id: "acct-main-snapshot" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "main-snapshot", refresh_token: "fixture-main-refresh", account_id: "acct-main-snapshot" },
     }));
     globalThis.fetch = (async () => Response.json({
       email: "snapshot@example.test",
@@ -759,11 +760,11 @@ describe("codex-auth API", () => {
 
     await listMain();
     rmSync(join(TEST_CODEX_HOME, "auth.json"));
-    expect((await listMain()).hasCredential).toBe(false);
+    expect((await listMain()).hasCredential).toBe(true);
     drain = acquireNativeMainProfileDrain("credential-snapshot-warm-cache");
     try {
       const main = await listMain();
-      expect(main.hasCredential).toBe(false);
+      expect(main.hasCredential).toBe(true);
       expect(main).not.toHaveProperty("quotaRefresh");
     } finally {
       drain?.release();
@@ -771,8 +772,8 @@ describe("codex-auth API", () => {
   });
 
   test("bulk pause retains native-main ownership through pool settlement and persisted publication", async () => {
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "main-pause-owned", account_id: "acct-main-pause-owned" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "main-pause-owned", refresh_token: "fixture-main-refresh", account_id: "acct-main-pause-owned" },
     }));
     const config = makeConfig();
     seedPoolAccount(config, { id: "pause-pool", email: "pool@example.test", plan: "plus" });
@@ -827,8 +828,8 @@ describe("codex-auth API", () => {
   });
 
   test("bulk pause settles a rejected pool probe before atomically publishing main pause", async () => {
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "main-pause-settled", account_id: "acct-main-pause-settled" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "main-pause-settled", refresh_token: "fixture-main-refresh", account_id: "acct-main-pause-settled" },
     }));
     const config = makeConfig();
     seedPoolAccount(config, { id: "busy-pool", email: "busy@example.test", plan: "plus" });
@@ -855,8 +856,8 @@ describe("codex-auth API", () => {
   });
 
   test("main reset-credit consume owns native main through destructive upstream work and rejects post-fence work", async () => {
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "main-reset-owned", account_id: "acct-main-reset-owned" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "main-reset-owned", refresh_token: "fixture-main-refresh", account_id: "acct-main-reset-owned" },
     }));
     let consumeCalls = 0;
     let releaseConsume!: () => void;
@@ -1047,6 +1048,7 @@ describe("codex-auth API", () => {
           baseUrl: "https://chatgpt.com/backend-api/codex",
           authMode: "forward",
           codexAccountMode: "pool",
+          upstreamWebsocket: false,
         },
       },
     });
@@ -1136,8 +1138,8 @@ describe("codex-auth API", () => {
   test("main account 401 with an undecodable-exp token is terminal and marks needsReauth (#327, #1932)", async () => {
     // "expired-main" is not a decodable JWT, so its exp cannot vouch for liveness.
     // Undecodable exp must fail toward reauth: only a decodable future exp counts as live.
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "expired-main", account_id: "acct-main" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "expired-main", refresh_token: "fixture-main-refresh", account_id: "acct-main" },
     }));
     globalThis.fetch = (async () => new Response("", { status: 401 })) as typeof fetch;
 
@@ -1151,8 +1153,8 @@ describe("codex-auth API", () => {
   });
 
   test("bare main account 401 with a verifiably live token is transient, not reauth (#1932)", async () => {
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: jwtWithExp(Math.floor(Date.now() / 1000) + 3600), account_id: "acct-main" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: jwtWithExp(Math.floor(Date.now() / 1000) + 3600), refresh_token: "fixture-main-refresh", account_id: "acct-main" },
     }));
     globalThis.fetch = (async () => new Response("", { status: 401 })) as typeof fetch;
 
@@ -1166,8 +1168,8 @@ describe("codex-auth API", () => {
   });
 
   test("main account 401 with a live token but terminal body code is still terminal (#1932)", async () => {
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: jwtWithExp(Math.floor(Date.now() / 1000) + 3600), account_id: "acct-main" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: jwtWithExp(Math.floor(Date.now() / 1000) + 3600), refresh_token: "fixture-main-refresh", account_id: "acct-main" },
     }));
     globalThis.fetch = (async () => Response.json(
       { detail: { code: "invalid_refresh_token" } },
@@ -1184,8 +1186,8 @@ describe("codex-auth API", () => {
   });
 
   test("main account 401 with an expired access token is terminal (#1932)", async () => {
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: jwtWithExp(1), account_id: "acct-main" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: jwtWithExp(1), refresh_token: "fixture-main-refresh", account_id: "acct-main" },
     }));
     globalThis.fetch = (async () => new Response("", { status: 401 })) as typeof fetch;
 
@@ -1199,8 +1201,8 @@ describe("codex-auth API", () => {
   });
 
   test("main account invalid-workspace 403 is terminal but a generic 403 is not (#327)", async () => {
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "workspace-main", account_id: "acct-main" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "workspace-main", refresh_token: "fixture-main-refresh", account_id: "acct-main" },
     }));
     globalThis.fetch = (async () => Response.json(
       { detail: { code: "invalid_workspace_selected" } },
@@ -1226,8 +1228,8 @@ describe("codex-auth API", () => {
   });
 
   test("successful main account refresh clears a prior needsReauth mark (#327)", async () => {
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "fresh-main", account_id: "acct-main" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "fresh-main", refresh_token: "fixture-main-refresh", account_id: "acct-main" },
     }));
     markAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
     globalThis.fetch = (async () => Response.json({
@@ -1251,8 +1253,8 @@ describe("codex-auth API", () => {
     // token, so the periodic refresh must not read its own 200 as proof the account
     // can serve traffic again — doing so returned the account to rotation, the next
     // request failed identically and re-marked it, and needsReauth never settled.
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "live-main", account_id: "acct-main" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "live-main", refresh_token: "fixture-main-refresh", account_id: "acct-main" },
     }));
     markAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
     clearMainAccountInfoCache();
@@ -1283,8 +1285,8 @@ describe("codex-auth API", () => {
     // re-read past a now-stale cache. That argument must not double as operator intent:
     // a background poll that crosses an identity change would otherwise come back with
     // the authority to retract a quarantine it was never allowed to touch.
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "live-main", account_id: "acct-before" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "live-main", refresh_token: "fixture-main-refresh", account_id: "acct-before" },
     }));
     clearMainAccountInfoCache();
     let usageCalls = 0;
@@ -1293,8 +1295,8 @@ describe("codex-auth API", () => {
       if (usageCalls === 1) {
         // Identity changes on disk mid-probe. The retry's purge legitimately drops the
         // *previous* identity's runtime state — that is not what this test is about.
-        writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-          tokens: { access_token: "live-main", account_id: "acct-after" },
+        writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+          tokens: { access_token: "live-main", refresh_token: "fixture-main-refresh", account_id: "acct-after" },
         }));
       } else {
         // Real traffic quarantines the *new* identity while the retry probe is in
@@ -1316,12 +1318,7 @@ describe("codex-auth API", () => {
   });
 
   test("BUG-R327: main account exposes and updates needsReauth from WHAM auth responses", async () => {
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: {
-        access_token: "main-access",
-        account_id: "main-account",
-      },
-    }));
+    writeNativeMainAuthTokensForTests(join(TEST_CODEX_HOME, "auth.json"), { access_token: "main-access", refresh_token: "fixture-main-refresh", account_id: "main-account" });
     let status = 401;
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       expect(String(input)).toBe("https://chatgpt.com/backend-api/wham/usage");
@@ -2055,12 +2052,7 @@ describe("codex-auth API", () => {
   });
 
   test("main account list uses chatgpt_plan_type when WHAM omits plan_type (#1989)", async () => {
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: {
-        access_token: chatgptPlanJwt("pro", "acct-main-jwt"),
-        account_id: "acct-main-jwt",
-      },
-    }));
+    writeNativeMainAuthTokensForTests(join(TEST_CODEX_HOME, "auth.json"), { access_token: chatgptPlanJwt("pro", "acct-main-jwt"), refresh_token: "fixture-main-refresh", account_id: "acct-main-jwt" });
     globalThis.fetch = (async () => Response.json({
       email: "main-jwt@example.test",
       rate_limit: { primary_window: { used_percent: 2, reset_at: 1782628379 } },
@@ -3027,8 +3019,8 @@ describe("codex-auth API", () => {
     // /wham/usage carries rate_limit_reset_credits only intermittently. Pool DTOs survive
     // that because they re-read the merged store; the main DTO used to serialize the raw
     // parse result, so the ticket badge disappeared on every response that omitted it.
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "main-dto-credits", account_id: "acct-main-dto-credits" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "main-dto-credits", refresh_token: "fixture-main-refresh", account_id: "acct-main-dto-credits" },
     }));
     reconcileMainCodexAccountRuntimeState();
     const originalFetch = globalThis.fetch;
@@ -3064,8 +3056,8 @@ describe("codex-auth API", () => {
     // `__main__` is an alias: ~/.codex/auth.json can be swapped for another physical
     // ChatGPT account, so a carried ticket count must be bound to the identity it was read
     // from or one account's credits show up on another's card.
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "main-ident-a", account_id: "acct-main-ident-a" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "main-ident-a", refresh_token: "fixture-main-refresh", account_id: "acct-main-ident-a" },
     }));
     reconcileMainCodexAccountRuntimeState();
     const originalFetch = globalThis.fetch;
@@ -3089,8 +3081,8 @@ describe("codex-auth API", () => {
 
       // The operator signs in as a different physical account and the next usage response
       // happens not to carry the summary.
-      writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-        tokens: { access_token: "main-ident-b", account_id: "acct-main-ident-b" },
+      writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+        tokens: { access_token: "main-ident-b", refresh_token: "fixture-main-refresh", account_id: "acct-main-ident-b" },
       }));
       includeCredits = false;
       const second = await listCodexAuthAccounts(makeConfig(), true);
@@ -3104,8 +3096,8 @@ describe("codex-auth API", () => {
   test("a freshly parsed main resetCredits of zero overrides the stored value", async () => {
     // Zero is a real reading, not an absence: the DTO fill must never resurrect a stale
     // non-zero ticket count over it.
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "main-dto-zero", account_id: "acct-main-dto-zero" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "main-dto-zero", refresh_token: "fixture-main-refresh", account_id: "acct-main-dto-zero" },
     }));
     reconcileMainCodexAccountRuntimeState();
     updateAccountQuota(MAIN_CODEX_ACCOUNT_ID, undefined, undefined, undefined, undefined, 3);
@@ -3133,8 +3125,8 @@ describe("codex-auth API", () => {
   });
 
   test("reset-credit consume omits remaining when main WHAM refresh is non-2xx", async () => {
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "main-reset-fail", account_id: "acct-main-reset-fail" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "main-reset-fail", refresh_token: "fixture-main-refresh", account_id: "acct-main-reset-fail" },
     }));
     // Stabilize identity tracking so seeding stale quota is not purged by reconcile.
     reconcileMainCodexAccountRuntimeState();
@@ -3167,8 +3159,8 @@ describe("codex-auth API", () => {
   });
 
   test("reset-credit consume omits remaining when main WHAM omits rate_limit_reset_credits", async () => {
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "main-reset-omit", account_id: "acct-main-reset-omit" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "main-reset-omit", refresh_token: "fixture-main-refresh", account_id: "acct-main-reset-omit" },
     }));
     reconcileMainCodexAccountRuntimeState();
     updateAccountQuota(MAIN_CODEX_ACCOUNT_ID, undefined, undefined, undefined, undefined, 6);
@@ -3205,8 +3197,8 @@ describe("codex-auth API", () => {
 
   // Adapted from luvs01's #3995, e172453052bf7bbc4a0ae5aa24592982c0c64b15.
   test.each(["reset", "already_redeemed"])("cold main %s returns fresh WHAM credits without a prior lookup", async code => {
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "cold-main-reset-token", account_id: "cold-main-reset-account" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "cold-main-reset-token", refresh_token: "fixture-main-refresh", account_id: "cold-main-reset-account" },
     }));
     // Intentionally no listing, reconciliation, writer observation or quota seed.
     let consumeCalls = 0; let usageCalls = 0;
@@ -3240,8 +3232,8 @@ describe("codex-auth API", () => {
   });
 
   test("reset-credit consume returns remaining from fresh main WHAM credits", async () => {
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "main-reset-ok", account_id: "acct-main-reset-ok" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "main-reset-ok", refresh_token: "fixture-main-refresh", account_id: "acct-main-reset-ok" },
     }));
     reconcileMainCodexAccountRuntimeState();
     updateAccountQuota(MAIN_CODEX_ACCOUNT_ID, undefined, undefined, undefined, undefined, 9);
@@ -4171,8 +4163,8 @@ describe("codex-auth API", () => {
   });
 
   test("bulk pause preserves a known Free main plan when WHAM omits plan_type", async () => {
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "main-access", account_id: "main-account" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "main-access", refresh_token: "fixture-main-refresh", account_id: "main-account" },
     }));
     let call = 0;
     globalThis.fetch = (async () => {
@@ -4204,8 +4196,8 @@ describe("codex-auth API", () => {
   });
 
   test("bulk pause fails closed when the main quota plan cannot be established", async () => {
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "main-access", account_id: "main-account" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "main-access", refresh_token: "fixture-main-refresh", account_id: "main-account" },
     }));
     globalThis.fetch = (async () => Response.json({
       email: "main@example.test",
@@ -4243,12 +4235,13 @@ describe("codex-auth API", () => {
   });
 
   test("repeated main bulk-pause reads honor failed-query pacing under a shared claim", async () => {
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "bulk-main-access", account_id: "bulk-main-account" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "bulk-main-access", refresh_token: "fixture-main-refresh", account_id: "bulk-main-account" },
     }));
     const config = makeConfig({ providers: { openai: {
       adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex",
       authMode: "forward", codexAccountMode: "pool",
+      upstreamWebsocket: false,
     } } });
     let calls = 0;
     globalThis.fetch = (async () => { calls++; return new Response(null, { status: 503 }); }) as typeof fetch;
@@ -4303,8 +4296,8 @@ describe("codex-auth API", () => {
   });
 
   test("PUT /api/codex-auth/accounts/pause-exhausted includes a freshly exhausted main account", async () => {
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "main-access", account_id: "main-account" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "main-access", refresh_token: "fixture-main-refresh", account_id: "main-account" },
     }));
     globalThis.fetch = (async () => Response.json({
       email: "main@example.test",
@@ -4410,6 +4403,7 @@ describe("codex-auth API", () => {
           baseUrl: "https://chatgpt.com/backend-api/codex",
           authMode: "forward",
           codexAccountMode: "direct",
+          upstreamWebsocket: false,
         },
       },
     });
@@ -4575,8 +4569,8 @@ describe("codex-auth API", () => {
       expiresAt: Date.now() + 5 * 60_000,
       chatgptAccountId: "legacy-pool-account",
     });
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "desktop-access", account_id: "desktop-account" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "desktop-access", refresh_token: "fixture-main-refresh", account_id: "desktop-account" },
     }));
 
     expect(getMainChatgptAccountId()).toBe("desktop-account");
@@ -6399,9 +6393,10 @@ describe("manual reset cooldown recovery (#3973)", () => {
     const config = makeConfig({ codexMainAccountHardLock: true, providers: { openai: {
       adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex",
       authMode: "forward", codexAccountMode: "pool",
+      upstreamWebsocket: false,
     } } });
     const accessToken = "ordered-main-token"; const accountId = "ordered-main-account";
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({ tokens: { access_token: accessToken, account_id: accountId } }));
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({ tokens: { access_token: accessToken, refresh_token: "fixture-main-refresh", account_id: accountId } }));
     reconcileMainCodexAccountRuntimeState();
     const writer = observeMainQuotaCredential(accessToken, accountId)!;
     setAccountQuotaFromParsed(MAIN_CODEX_ACCOUNT_ID, { weeklyPercent: 100, resetCredits: 5 }, captureConfigGeneration(), writer);
@@ -6451,8 +6446,8 @@ describe("manual reset cooldown recovery (#3973)", () => {
   });
 
   test("concurrent same-key main reads share one published quota result", async () => {
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "publication-main-token", account_id: "publication-main-account" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "publication-main-token", refresh_token: "fixture-main-refresh", account_id: "publication-main-account" },
     }));
     reconcileMainCodexAccountRuntimeState();
     const started = gate(); const finish = gate(); let reads = 0;
@@ -6476,12 +6471,13 @@ describe("manual reset cooldown recovery (#3973)", () => {
   });
 
   test.each(["absent", "direct"])("%s non-pool main forces dispatch after a failed read", async mode => {
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "non-pool-access", account_id: "non-pool-account" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "non-pool-access", refresh_token: "fixture-main-refresh", account_id: "non-pool-account" },
     }));
     const config = makeConfig(mode === "direct" ? { providers: { openai: {
       adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex",
       authMode: "forward", codexAccountMode: "direct",
+      upstreamWebsocket: false,
     } } } : {});
     let calls = 0;
     globalThis.fetch = (async () => { calls++; return new Response(null, { status: 503 }); }) as typeof fetch;
@@ -6492,8 +6488,8 @@ describe("manual reset cooldown recovery (#3973)", () => {
 
   test("main reset usage does not erase an existing reauth quarantine", async () => {
     const config = makeConfig();
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "manual-main-token", account_id: "manual-main-account" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "manual-main-token", refresh_token: "fixture-main-refresh", account_id: "manual-main-account" },
     }));
     reconcileMainCodexAccountRuntimeState();
     cool(config, MAIN_CODEX_ACCOUNT_ID);
@@ -6508,8 +6504,8 @@ describe("manual reset cooldown recovery (#3973)", () => {
   test("conflicting main token/header identity supplies no recovery proof", async () => {
     const config = makeConfig();
     const payload = Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "token-account" } })).toString("base64url");
-    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
-      tokens: { access_token: "manual-main-token", id_token: `e30.${payload}.sig`, account_id: "header-account" },
+    writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "manual-main-token", refresh_token: "fixture-main-refresh", id_token: `e30.${payload}.sig`, account_id: "header-account" },
     }));
     reconcileMainCodexAccountRuntimeState(); cool(config, MAIN_CODEX_ACCOUNT_ID);
     const urls = mock(() => Response.json({ code: "reset" }), () => Response.json(usage()));
@@ -6521,7 +6517,7 @@ describe("manual reset cooldown recovery (#3973)", () => {
   test.each(["same", "bearer", "other-account", "aba"])("main recovery uses its own live credential proof: %s", async change => {
     const config = makeConfig();
     const writeMain = (accountId: string, accessToken = "manual-main-token") => {
-      writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({ tokens: { access_token: accessToken, account_id: accountId } }));
+      writeNativeMainAuthFileForTests(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({ tokens: { access_token: accessToken, refresh_token: "fixture-main-refresh", account_id: accountId } }));
     };
     writeMain("manual-main-account"); reconcileMainCodexAccountRuntimeState();
     cool(config, MAIN_CODEX_ACCOUNT_ID);
