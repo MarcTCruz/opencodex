@@ -20,6 +20,7 @@ import { signedInCodexAccountIds } from "../../src/codex/account-preservation";
 import { getEligiblePoolAccounts } from "../../src/codex/routing/selection";
 import { rememberActiveCodexAccount } from "../../src/codex/routing/active-account";
 import { initializeMainAccountPolicyBinding, reconcileMainCodexAccountRuntimeState, resetMainCodexAccountIdentityTrackingForTests } from "../../src/codex/account-lifecycle";
+import { observeNativeMainAuthFile } from "../../src/codex/native-main-credentials";
 import { acquireNativeMainProfileDrain, resetLifecycleDrainStateForTests } from "../../src/server/lifecycle";
 import { setAsyncIcaclsRunnerForTests, setIcaclsRunnerForTests } from "../../src/lib/windows-secret-acl";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
@@ -30,7 +31,7 @@ let previousHome: string | undefined, previousCodex: string | undefined;
 const aclOk = { success: true, exitCode: 0, timedOut: false, stdout: "", stderr: "" };
 function mainLogin(email = "member@example.test", accountId = "workspace-a") {
   const id_token = `h.${Buffer.from(JSON.stringify({ email, chatgpt_account_id: accountId })).toString("base64url")}.s`;
-  writeFileSync(authPath, JSON.stringify({ tokens: { access_token: "synthetic-main", id_token, account_id: accountId } }));
+  writeFileSync(authPath, JSON.stringify({ tokens: { access_token: "synthetic-main", refresh_token: "synthetic-refresh", id_token, account_id: accountId } }));
 }
 function config(strategy: OcxConfig["accountPoolStrategy"] = "quota"): OcxConfig {
   const c: OcxConfig = { ...getDefaultConfig(), autoSwitchThreshold: 80,
@@ -118,13 +119,17 @@ test("same workspace different member and same member different workspace are in
   c.codexAccounts![1]!.email = "another@example.test";
   saveCodexAccountCredential("other", { accessToken: "synthetic", refreshToken: "synthetic-r", expiresAt: Date.now() + 300_000, chatgptAccountId: "workspace-a" });
   expect([...signedInCodexAccountIds(c)]).toEqual(["__main__", "copy"]);
-  mainLogin("member@example.test", "workspace-b"); reconcileMainCodexAccountRuntimeState();
+  mainLogin("member@example.test", "workspace-b");
+  observeNativeMainAuthFile(authPath);
+  reconcileMainCodexAccountRuntimeState();
   expect([...signedInCodexAccountIds(c)]).toEqual(["__main__"]);
 });
 test("owned login replacement and pool credential replacement update protected entries", async () => {
   const c = config();
   expect((await (await api(c)).json()).affectedAccountIds).toEqual(["__main__", "copy"]);
-  mainLogin("other@example.test", "workspace-b"); reconcileMainCodexAccountRuntimeState();
+  mainLogin("other@example.test", "workspace-b");
+  observeNativeMainAuthFile(authPath);
+  reconcileMainCodexAccountRuntimeState();
   expect([...signedInCodexAccountIds(c)]).toEqual(["__main__", "other"]);
   saveCodexAccountCredential("other", { accessToken: "replacement", refreshToken: "replacement-r", expiresAt: Date.now() + 300_000, chatgptAccountId: "workspace-c" });
   expect([...signedInCodexAccountIds(c)]).toEqual(["__main__"]);
@@ -163,12 +168,14 @@ test("config loads malformed policy safely without discarding providers", () => 
 
 test("missing member or conflicting tokens never link an ordinary pool entry", async () => {
   const c = config();
-  writeFileSync(authPath, JSON.stringify({ tokens: { access_token: "synthetic-opaque", account_id: "workspace-a" } }));
+  writeFileSync(authPath, JSON.stringify({ tokens: { access_token: "synthetic-opaque", refresh_token: "synthetic-refresh", account_id: "workspace-a" } }));
+  observeNativeMainAuthFile(authPath);
   reconcileMainCodexAccountRuntimeState();
   expect([...signedInCodexAccountIds(c)]).toEqual(["__main__"]);
   expect((await (await api(c)).json()).identityKnown).toBe(false);
   const conflicting = `h.${Buffer.from(JSON.stringify({ email: "member@example.test", chatgpt_account_id: "workspace-x" })).toString("base64url")}.s`;
-  writeFileSync(authPath, JSON.stringify({ tokens: { access_token: "synthetic-opaque", id_token: conflicting, account_id: "workspace-a" } }));
+  writeFileSync(authPath, JSON.stringify({ tokens: { access_token: "synthetic-opaque", refresh_token: "synthetic-refresh", id_token: conflicting, account_id: "workspace-a" } }));
+  observeNativeMainAuthFile(authPath);
   reconcileMainCodexAccountRuntimeState();
   expect([...signedInCodexAccountIds(c)]).toEqual(["__main__"]);
   expect((await api(c, { enabled: false })).status).toBe(503);
@@ -178,7 +185,9 @@ test("confirmed main replacement retires main bindings before selecting new work
   const c = config(); c.codexPreserveSignedInAccount = false; c.activeCodexAccountId = "__main__";
   setCodexAccountPin(c, "__main__"); reconcileMainCodexAccountRuntimeState();
   expect(resolveCodexAccountForThread("native-existing", c)).toBe("__main__");
-  mainLogin("other@example.test", "workspace-b"); reconcileMainCodexAccountRuntimeState();
+  mainLogin("other@example.test", "workspace-b");
+  observeNativeMainAuthFile(authPath);
+  reconcileMainCodexAccountRuntimeState();
   c.codexPreserveSignedInAccount = true; delete c.activeCodexAccountPinned;
   expect(resolveCodexAccountForThread("native-existing", c)).toBe("copy");
 });
@@ -201,6 +210,7 @@ test("healthy binding without a manual pin stays on its account until explicit t
 
 test("transient malformed native-login reads retain the last owned identity preference", () => {
   const c = config(); writeFileSync(authPath, "{");
+  observeNativeMainAuthFile(authPath);
   reconcileMainCodexAccountRuntimeState();
   expect([...signedInCodexAccountIds(c)]).toEqual(["__main__", "copy"]);
   expect(getEligiblePoolAccounts(c, undefined, Date.now(), undefined, { nativeMainSelectionOnly: true })).toEqual(["other"]);
@@ -220,7 +230,8 @@ test("failed persistence keeps the previous policy, manual pin and live binding"
 test("conflicting token claims cannot retract an existing owned identity observation", () => {
   const c = config();
   const id_token = `h.${Buffer.from(JSON.stringify({ email: "member@example.test", chatgpt_account_id: "workspace-x" })).toString("base64url")}.s`;
-  writeFileSync(authPath, JSON.stringify({ tokens: { access_token: "synthetic", id_token, account_id: "workspace-a" } }));
+  writeFileSync(authPath, JSON.stringify({ tokens: { access_token: "synthetic", refresh_token: "synthetic-refresh", id_token, account_id: "workspace-a" } }));
+  observeNativeMainAuthFile(authPath);
   reconcileMainCodexAccountRuntimeState();
   expect([...signedInCodexAccountIds(c)]).toEqual(["__main__", "copy"]);
 });

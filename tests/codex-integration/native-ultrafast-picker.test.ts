@@ -235,7 +235,7 @@ describe("an Ultrafast request on the native route", () => {
 
   async function outboundTier(fastMode: boolean | undefined, callerTier: string | undefined): Promise<unknown> {
     const token = `header.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1_000) + 86_400 })).toString("base64url")}.signature`;
-    writeFileSync(join(home, "auth.json"), JSON.stringify({ tokens: { access_token: token, account_id: "ultrafast-main" } }));
+    writeFileSync(join(home, "auth.json"), JSON.stringify({ tokens: { access_token: token, refresh_token: "synthetic-refresh", account_id: "ultrafast-main" } }));
     const sent: Record<string, unknown>[] = [];
     const upstream = {
       id: "resp_ultrafast", object: "response", status: "completed", model: "gpt-6.1-sol",
