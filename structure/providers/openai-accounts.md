@@ -291,28 +291,15 @@ only the refresh's own 30-second timeout: success rotates and retires the old
 refresh token, so cancellation cannot discard the only live grant. Both locks
 await the callback through completion, including publication; aborting their
 wait signal does not release an acquired lock while the exchange runs.
-The native-main store watches CODEX_HOME/auth.json, is the sole OpenCodex writer,
-and serves readers from its last complete in-memory snapshot.
-ChatGPT envelopes need non-empty access and refresh tokens; API-key envelopes need a non-empty key.
-Refresh captures file identity, digest, and observation generation before exchange;
-the same fence governs publication and retries, blocking later changes even when
-the caller cancels. Complete external credentials win without expiry or account
-precedence. Invalid or unreadable content and missing-file grace retain the
-last complete credential and block refresh/writes; confirmed deletion clears
-memory after ten minutes. A hiccup keeps the rotated grant in memory; retries keep its original fence.
-
-- `written`: The file and memory hold the rotated grant; the request gets its stored access token.
-- `retained`: Memory holds the rotated grant pending retry; the request gets its memory access token.
-- `recovery-required`: Memory holds the pending grant for recovery; the request gets the exchanged access token.
-- `superseded`: Memory adopts a complete external credential; this request gets the exchanged access token.
-- `deleted`: Confirmed deletion clears memory; the request gets no token.
-- `stopped`: The store publishes no rotated grant; the request gets no token.
-
-For `superseded` and `recovery-required`, the in-flight access token goes to the request while memory
-independently follows the file observation; neither refusal marks the old grant rejected (#2999).
-Written and retained results advance the credential mutation epoch before clearing grant rejection and
-applicable reauth quarantine, then surface caller cancellation. Same-identity device reauth obtains a
-new login grant through the central writer under its existing pre-publication claim.
+The native-main store watches CODEX_HOME/auth.json, is the sole OpenCodex writer, and serves readers its last
+complete in-memory snapshot. Refresh and publication share one fence (file identity, digest, observation generation)
+that holds through caller cancellation. Invalid, unreadable, or missing content keeps the last complete credential
+and blocks refresh and writes; a missing file is a logout only after ten minutes. A hiccup keeps the rotated grant in
+memory. Results: `written` and `retained` keep the rotated grant in file or memory and return its access token;
+`recovery-required` and `superseded` return the in-flight access token while memory follows the file; `deleted` and
+`stopped` return no token. Neither `recovery-required` nor `superseded` marks the old grant rejected (#2999). Written
+and retained results advance the credential mutation epoch before clearing grant rejection and reauth quarantine,
+then surface caller cancellation. Same-identity device reauth obtains a new login grant through the central writer.
 
 ## Native-main refresh ownership
 
