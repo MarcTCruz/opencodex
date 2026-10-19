@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getMainAccountToken, getValidMainAccountToken, setMainAuthJsonBeforeRenameHookForTests } from "../../src/codex/main-account";
 import { readCodexTokensResult } from "../../src/codex/auth-collision";
-import { getNativeMainAuthMemory, readNativeMainAuthDescriptorBounded, stopNativeMainCredentialWatchers } from "../../src/codex/native-main-credentials";
+import { getNativeMainAuthMemory, observeNativeMainAuthFile, readNativeMainAuthDescriptorBounded, stopNativeMainCredentialWatchers } from "../../src/codex/native-main-credentials";
 import { MAX_AUTH_BYTES } from "../../src/codex/native-profile-store";
 import { resetOptionalShutdownHooksForTests, runOptionalShutdownHooks } from "../../src/lib/optional-shutdown-hooks";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
@@ -281,6 +281,10 @@ describe("native-main credential memory", () => {
     writeFileSync(authPath, auth("access-good"));
     expect(getMainAccountToken()?.accessToken).toBe("access-good");
     writeFileSync(authPath, "");
+    const observed = observeNativeMainAuthFile(authPath);
+    expect(observed).toMatchObject({ status: "ok", fileStatus: "invalid" });
+    observed.raw?.fill(0);
+    observed.snapshot?.raw.fill(0);
     expect(getMainAccountToken()?.accessToken).toBe("access-good");
   });
 
@@ -288,6 +292,10 @@ describe("native-main credential memory", () => {
     writeFileSync(authPath, auth("access-good"));
     expect(getMainAccountToken()?.accessToken).toBe("access-good");
     writeFileSync(authPath, "{\"tokens\":{\"access_token\":\"partial");
+    const observed = observeNativeMainAuthFile(authPath);
+    expect(observed).toMatchObject({ status: "ok", fileStatus: "invalid" });
+    observed.raw?.fill(0);
+    observed.snapshot?.raw.fill(0);
     expect(getMainAccountToken()?.accessToken).toBe("access-good");
   });
 

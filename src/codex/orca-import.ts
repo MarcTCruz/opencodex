@@ -152,8 +152,10 @@ function prepare(sourceDir: string, registryPath: string) {
   if (mainObservation.status === "invalid" || mainObservation.fileStatus === "invalid") {
     throw new OrcaImportError("Main Codex identity is unknown; import refused.");
   }
+  // "missing" means no login is held in memory, so there is no main identity to protect. A login
+  // kept through the deletion grace reports "ok" with a missing file and stays refused.
   if ((mainObservation.status !== "ok" || mainObservation.fileStatus !== "valid")
-    && !(mainObservation.status === "missing" && mainObservation.deletionConfirmed)) {
+    && mainObservation.status !== "missing") {
     throw new OrcaImportError("Main Codex identity is not confirmed; import refused.");
   }
   const mainRaw = mainObservation.snapshot?.raw.toString("utf-8");

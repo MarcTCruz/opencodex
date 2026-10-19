@@ -16,7 +16,7 @@ const ALLOWED: string[] = [
   "src/codex/native-profile-store.ts:377",
   "src/codex/orca-auth-source.ts:85",
   "src/codex/orca-import.ts:145",
-  "src/codex/orca-import.ts:200",
+  "src/codex/orca-import.ts:202",
   "src/config.ts:220",
   "src/lib/config-ownership.ts:41",
   "src/oauth/command-code.ts:40",

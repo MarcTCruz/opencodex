@@ -1419,11 +1419,10 @@ export class NativeProfileManager {
         await this.onSwitchBoundary("journal-prepared");
         this.assertOperationStorageStable();
         targetReceipt = await this.writeNativeAuth(this.context.authPath, target.text, sourceFence);
-        this.assertNativeAuthReceiptCurrent(targetReceipt);
         const observedTarget = this.verifyWrittenEnvelope(target.digest, targetProfile.identityHash, key);
         observedTarget.raw.fill(0);
-        this.assertNativeAuthReceiptCurrent(targetReceipt);
         advanceCodexCredentialMutationEpoch();
+        this.assertNativeAuthReceiptCurrent(targetReceipt);
         await this.onSwitchBoundary("auth-replaced");
         this.assertNativeAuthReceiptCurrent(targetReceipt);
         journal.phase = "auth-replaced";

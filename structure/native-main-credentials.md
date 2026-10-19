@@ -8,8 +8,9 @@ files and explicitly managed Orca homes remain separate inputs.
 Ordinary credential reads follow a symlinked `auth.json` to preserve Codex-home compatibility. The
 snapshot keeps that link provenance. Bounded token reads, native-profile reads and writability
 checks, and Orca main-identity reads reject a symlink. Orca asks the store for a current observation
-and proceeds only with a valid current file or a confirmed missing file; stopped, invalid, unreadable,
-and grace-period states are refused.
+and proceeds only with a valid current file or no main login at all (status `missing`); stopped,
+invalid, and unreadable states are refused. A login retained through the deletion grace (status `ok`,
+file `missing`) is refused too.
 
 Credential reads use a descriptor opened with no-follow where the platform supports it. The reader
 starts with the observed file size, grows its buffer only as needed up to the 4 MiB limit plus one

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -232,6 +232,20 @@ describe("main account in codex refresh mode (#2999)", () => {
     expect(readFileSync(join(home, "auth.json"), "utf8")).toBe(original);
     expect(readdirSync(home).filter(name => name.startsWith("auth.json"))).toEqual(["auth.json"]);
     expect(codexCredentialMutationEpoch()).toBe(epochBefore);
+  });
+
+  test("a symlinked auth.json is still refreshed by Codex, and the link target is not written", async () => {
+    setNativeMainRefreshResolutionForTests(CODEX_MODE);
+    const target = join(root, "real-auth.json");
+    const original = JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: expired(), refresh_token: "codex-owned-grant", account_id: "acct-main" } });
+    writeFileSync(target, original);
+    symlinkSync(target, join(home, "auth.json"));
+    const fresh = fakeChatGptJwt("acct-main");
+    const { calls, codexAuthStatus } = seam(() => ({ authMethod: "chatgpt", authToken: fresh, requiresOpenaiAuth: true }));
+
+    expect(await getValidMainAccountToken({ codexAuthStatus })).toEqual({ accessToken: fresh, chatgptAccountId: "acct-main" });
+    expect(calls).toEqual([{ refresh: true }]);
+    expect(readFileSync(target, "utf8")).toBe(original);
   });
 
   test("the RPC answer is used even when Codex moved the login to its keyring", async () => {

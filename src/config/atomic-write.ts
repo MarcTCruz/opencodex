@@ -481,7 +481,7 @@ export interface AtomicWriteAsyncTestSeam {
 
 export interface AtomicWriteAsyncHooks {
   beforeRename?: (targetPath: string) => void | Promise<void>;
-  validateBeforeRename?: (targetPath: string, replacementIdentity?: AtomicWriteTargetIdentity) => void | Promise<void>;
+  validateBeforeRename?: (targetPath: string, replacementIdentity?: AtomicWriteTargetIdentity) => void;
   afterRename?: (targetPath: string, identity?: AtomicWriteTargetIdentity) => void | Promise<void>;
   afterRenameEvidence?: (targetPath: string, evidence: AtomicWritePublicationEvidence) => void | Promise<void>;
 }

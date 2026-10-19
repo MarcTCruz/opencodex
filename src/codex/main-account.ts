@@ -486,10 +486,13 @@ async function resolveMainAccountToken(
       () => withCodexRefreshFileLock(lockKey, signal, async () => {
         const observation = observeNativeMainAuthFile(join(resolveCodexHomeDir(), "auth.json"));
         const locked = readMainAuthJsonCredential();
-        if (!observation.canRefreshOrWrite) {
+        // Codex mode refreshes through Codex, which owns its own write, so a symlinked auth.json
+        // (not writable by OpenCodex) must not block it. OpenCodex mode still stays gated.
+        if (refreshMode?.mode !== "codex" && !observation.canRefreshOrWrite) {
           observation.raw?.fill(0);
           observation.snapshot?.raw.fill(0);
-          if (locked?.accessToken && locked.accessToken !== rejectedAccessToken) {
+          if (locked?.accessToken && locked.accessToken !== rejectedAccessToken
+            && mainAccessTokenFresh(locked.accessToken, Date.now(), 0)) {
             return { accessToken: locked.accessToken, chatgptAccountId: locked.chatgptAccountId };
           }
           return null;

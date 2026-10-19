@@ -1397,6 +1397,7 @@ describe("native main profile transactions", () => {
       },
     });
 
+    const epochBefore = codexCredentialMutationEpoch();
     let caught: unknown;
     try { await manager.switch("work", true); } catch (error) { caught = error; }
 
@@ -1407,6 +1408,7 @@ describe("native main profile transactions", () => {
     expect(switchBoundaryReached).toBe(false);
     expect(successfulAuthReceipts).toBe(0);
     expect(rollbackAttempts).toBe(0);
+    expect(codexCredentialMutationEpoch()).toBeGreaterThanOrEqual(epochBefore + 1);
     expect(readFileSync(authPath, "utf8")).toBe(f.target);
     expect(existsSync(manager.context.journalPath)).toBe(true);
   });

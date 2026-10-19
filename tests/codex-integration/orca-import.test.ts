@@ -136,6 +136,24 @@ describe("offline Orca import", () => {
     expect(() => importOrcaAccounts({ sourceDir: source, registryPath: registry }))
       .toThrow("Main Codex identity is unknown; import refused.");
   });
+  test("no main login at all lets preview and apply continue", () => {
+    addSource();
+    const emptyHome = join(scratch, "empty-main");
+    mkdirSync(emptyHome);
+    process.env.CODEX_HOME = emptyHome;
+    expect(importOrcaAccounts({ sourceDir: source, registryPath: registry })).toMatchObject({ mode: "preview", eligible: 1, imported: 0 });
+    expect(importOrcaAccounts({ sourceDir: source, registryPath: registry, apply: true })).toMatchObject({ imported: 1 });
+  });
+  test("a main login retained through the deletion grace still refuses the import", () => {
+    addSource();
+    const authPath = join(main, "auth.json");
+    const warm = getNativeMainAuthMemory(authPath);
+    warm.snapshot?.raw.fill(0);
+    warm.raw?.fill(0);
+    unlinkSync(authPath);
+    expect(() => importOrcaAccounts({ sourceDir: source, registryPath: registry }))
+      .toThrow("Main Codex identity is unknown; import refused.");
+  });
   test("retry completes interrupted registration using the same untouched credential record", () => {
     const path = addSource();
     const options = { sourceDir: source, registryPath: registry };
