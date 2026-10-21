@@ -640,6 +640,8 @@ export interface OcxConfig {
    * is found, otherwise "opencodex". "codex" also falls back when no such binary exists.
    */
   nativeMainRefresh?: "codex" | "opencodex";
+  /** Whole seconds to retain the last good native main login while auth.json is not complete; integer 1-86400, default 60. */
+  nativeMainAuthGraceSeconds?: number;
   /** Use included quota to 100% for these accounts; preserves thresholds and credit-spending policy. */
   codexUseRemainingQuotaAccountIds?: string[];
   /** Explicit top-level deletion intent used by stale whole-config rebases. */

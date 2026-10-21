@@ -29,20 +29,19 @@ One classifier decides whether observed content is complete enough to replace me
 login needs non-empty access and refresh tokens; an API-key login needs a non-empty key. The profile
 parser separately requires its ID-token and account-identity fields to encrypt a profile. Those
 fields do not arbitrate between complete logins: every complete external change wins without
-expiry, account, or other precedence checks. Empty, partial, malformed, or unreadable files leave
-the last good snapshot available, retain any rotated refresh grant, and pause refresh and every
-OpenCodex write. Missing files start a ten-minute grace period with the same write block. A valid
-file restored within that period is observed; after ten continuous minutes of confirmed absence,
-the cache and pending refresh are cleared so an old grant cannot recreate the file.
+expiry, account, or other precedence checks. Missing, empty, partial, malformed, or unreadable
+files leave the last good snapshot available, retain any rotated refresh grant, and pause refresh
+and every OpenCodex write for a grace period: `nativeMainAuthGraceSeconds`, default 60 seconds.
+The period starts at the first observation that is not a complete file. Only a complete file ends
+it; a read error or another incomplete observation does not restart it. A complete file replaces
+memory as soon as it is observed, at any time. When the period ends without a complete file, the
+cache, the pending refresh, and its retry timer are cleared so an old grant cannot recreate it.
 
-The observation record preserves witnessed presence from every probe, including the initial stat,
-leaf lstat, read, and both post-read probes. Any witnessed presence ends the absence interval even
-when the final probe sees disappearance. A read failure with a present leaf is an unknown hiccup,
-so it retains memory and a rotated refresh grant while blocking writes. Retry authority retains the
-original complete physical signature, including mtime and ctime; later recovery from an unknown
-observation does not excuse a subsequent observed rewrite. If bounded history no longer proves
-whether a complete change intervened, the grant remains in memory and recovery is required rather
-than adopting the old disk credential.
+A read failure with a present leaf is an unknown hiccup, so it retains memory and a rotated refresh
+grant while blocking writes. Retry authority retains the original complete physical signature,
+including mtime and ctime; later recovery from an unknown observation does not excuse a subsequent
+observed rewrite. If bounded history no longer proves whether a complete change intervened, the
+grant remains in memory and recovery is required rather than adopting the old disk credential.
 
 Refresh publication runs immediately through the shared temp-file/rename writer; there is no
 debounce. Final validation captures receipt authority before rename: the observation sequence and
@@ -86,8 +85,10 @@ allowed to combine live-path authority with raw I/O.
 After optional shutdown hooks run, a late accessor returns the defined `stopped` status and cannot
 start a watcher, timer, or retry.
 
-The ten-minute grace covers the interactive browser handoff rather than only a short filesystem
-rewrite gap. It bounds abandoned logins while avoiding a false logout during a normal login.
+The grace is a sanity check, not a delay: it keeps the middle states of a Codex login (a missing,
+empty, or half-written `auth.json`) from breaking requests that already use the last good login.
+A new login or an account switch is never delayed, because a complete file replaces memory as
+soon as it is observed. A logout takes effect when the period ends.
 
 ### Accepted remaining risk
 

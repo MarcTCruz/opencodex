@@ -12,6 +12,7 @@ import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { captureAtomicWritePublicationEvidence } from "../helpers/native-main-auth";
 import { repoPath } from "../helpers/repo-root";
 import { atomicWriteFile, atomicWriteFileAsync, type AtomicWriteAsyncIO, type AtomicWriteIO } from "../../src/config/atomic-write";
+import { getConfigPath, getDefaultConfig } from "../../src/config";
 
 type StoreMemoryRead = {
   status: string;
@@ -19,6 +20,8 @@ type StoreMemoryRead = {
   raw?: Buffer;
   digest?: string;
   observationError?: string;
+  graceActive?: boolean;
+  deletionConfirmed?: boolean;
   snapshot?: {
     raw: Buffer;
     digest: string;
@@ -32,6 +35,7 @@ type StoreModule = {
   NativeMainCredentialStore: new (options: {
     authPath: string;
     now?: () => number;
+    graceMs?: number;
     fileSystem?: Record<string, (...args: any[]) => unknown>;
     writeSyncIO?: {
       write: (path: string, content: string) => void;
@@ -127,6 +131,265 @@ afterEach(() => {
 });
 
 describe("native-main credential memory", () => {
+  test("the grace defaults to 60 seconds", async () => {
+    const store = await loadStoreModule();
+    let now = 1_000;
+    let observe: (() => void) | undefined;
+    const memory = new store.NativeMainCredentialStore({ authPath, now: () => now, fileSystem: {
+      watchDirectory: (() => ({ close() {}, unref() {} })) as never,
+      setInterval: ((callback: () => void) => { observe = callback; return { unref() {} }; }) as never,
+    } });
+    stores.push(memory);
+    writeFileSync(authPath, auth("access-good"));
+    memory.start();
+    unlinkSync(authPath);
+    observe?.();
+    expect(store.NATIVE_MAIN_AUTH_DELETE_GRACE_MS).toBe(60_000);
+    now = 60_999;
+    observe?.();
+    const retained = memory.readMemory();
+    expect(retained.raw?.toString()).toContain("access-good");
+    retained.raw?.fill(0);
+    retained.snapshot?.raw.fill(0);
+    now = 61_000;
+    observe?.();
+    const cleared = memory.readMemory();
+    expect(cleared.status).toBe("missing");
+    expect(cleared.raw).toBeUndefined();
+    expect(cleared.deletionConfirmed).toBe(true);
+    cleared.snapshot?.raw.fill(0);
+  });
+
+  test("a configured grace replaces the default", async () => {
+    const store = await loadStoreModule();
+    let now = 1_000;
+    let observe: (() => void) | undefined;
+    const memory = new store.NativeMainCredentialStore({ authPath, now: () => now, graceMs: 5_000, fileSystem: {
+      watchDirectory: (() => ({ close() {}, unref() {} })) as never,
+      setInterval: ((callback: () => void) => { observe = callback; return { unref() {} }; }) as never,
+    } });
+    stores.push(memory);
+    writeFileSync(authPath, auth("access-good"));
+    memory.start();
+    unlinkSync(authPath);
+    observe?.();
+    now = 5_999;
+    observe?.();
+    const retained = memory.readMemory();
+    expect(retained.raw?.toString()).toContain("access-good");
+    retained.raw?.fill(0);
+    retained.snapshot?.raw.fill(0);
+    now = 6_000;
+    observe?.();
+    const cleared = memory.readMemory();
+    expect(cleared.raw).toBeUndefined();
+    expect(cleared.deletionConfirmed).toBe(true);
+    cleared.snapshot?.raw.fill(0);
+  });
+
+  test("graceActive reports the running grace for an incomplete file", async () => {
+    const store = await loadStoreModule();
+    let observe: (() => void) | undefined;
+    const memory = new store.NativeMainCredentialStore({ authPath, fileSystem: {
+      watchDirectory: (() => ({ close() {}, unref() {} })) as never,
+      setInterval: ((callback: () => void) => { observe = callback; return { unref() {} }; }) as never,
+    } });
+    stores.push(memory);
+    writeFileSync(authPath, auth("access-good"));
+    memory.start();
+    writeFileSync(authPath, "");
+    observe?.();
+    const incomplete = memory.readMemory();
+    expect(incomplete.graceActive).toBe(true);
+    incomplete.raw?.fill(0);
+    incomplete.snapshot?.raw.fill(0);
+    writeFileSync(authPath, auth("access-next"));
+    observe?.();
+    const complete = memory.readMemory();
+    expect(complete.graceActive).toBe(false);
+    expect(complete.raw?.toString()).toContain("access-next");
+    complete.raw?.fill(0);
+    complete.snapshot?.raw.fill(0);
+  });
+
+  test("a read error or an incomplete file does not restart the grace", async () => {
+    const store = await loadStoreModule();
+    let now = 1_000;
+    let failStat = false;
+    const memory = new store.NativeMainCredentialStore({ authPath, now: () => now, fileSystem: {
+      stat: ((path: string) => {
+        if (failStat) throw Object.assign(new Error("stat failure"), { code: "EIO" });
+        return statSync(path);
+      }) as never,
+      watchDirectory: (() => ({ close() {}, unref() {} })) as never,
+      setInterval: (() => ({ unref() {} })) as never,
+    } });
+    stores.push(memory);
+    writeFileSync(authPath, auth("access-good"));
+    memory.start();
+    unlinkSync(authPath);
+    memory.observeNow();
+    now = 31_000;
+    failStat = true;
+    memory.observeNow();
+    failStat = false;
+    const unreadable = memory.readMemory();
+    expect(unreadable.fileStatus).toBe("unreadable");
+    expect(unreadable.raw?.toString()).toContain("access-good");
+    unreadable.raw?.fill(0);
+    unreadable.snapshot?.raw.fill(0);
+    now = 46_000;
+    writeFileSync(authPath, "{\"tokens\":{\"access_token\":\"partial");
+    memory.observeNow();
+    const invalid = memory.readMemory();
+    expect(invalid.fileStatus).toBe("invalid");
+    expect(invalid.raw?.toString()).toContain("access-good");
+    invalid.raw?.fill(0);
+    invalid.snapshot?.raw.fill(0);
+    now = 60_999;
+    unlinkSync(authPath);
+    memory.observeNow();
+    const retained = memory.readMemory();
+    expect(retained.raw?.toString()).toContain("access-good");
+    retained.raw?.fill(0);
+    retained.snapshot?.raw.fill(0);
+    now = 61_000;
+    memory.observeNow();
+    const cleared = memory.readMemory();
+    expect(cleared.status).toBe("missing");
+    expect(cleared.raw).toBeUndefined();
+    cleared.snapshot?.raw.fill(0);
+  });
+
+  test("an empty or partial file past the grace clears memory, the retained grant and its retry", async () => {
+    const store = await loadStoreModule();
+    for (const content of ["", "{\"tokens\":{\"access_token\":\"partial"] as const) {
+      let now = 1_000;
+      const timers: Array<() => void> = [];
+      let onDirectoryEvent: (() => void) | undefined;
+      let clearTimeoutCalls = 0;
+      let writeCalls = 0;
+      const memory = new store.NativeMainCredentialStore({
+        authPath,
+        now: () => now,
+        fileSystem: {
+          watchDirectory: ((_: string, onEvent: () => void) => {
+            onDirectoryEvent = onEvent;
+            return { close() {}, unref() {} };
+          }) as never,
+          setInterval: (() => ({ unref() {} })) as never,
+          setTimeout: ((callback: () => void) => {
+            timers.push(callback);
+            return { unref() {} };
+          }) as never,
+          clearTimeout: (() => { clearTimeoutCalls++; }) as never,
+        },
+        writeSyncIO: {
+          write: () => { writeCalls++; throw new Error("invalid file must not be replaced"); },
+          harden: () => {}, rename: () => {}, truncate: () => {}, unlink: () => {},
+        },
+      });
+      stores.push(memory);
+      writeFileSync(authPath, auth("access-old"));
+      memory.start();
+      const initial = memory.readMemory();
+      const expectedSnapshot = captureFence(initial);
+      initial.snapshot?.raw.fill(0);
+      initial.raw?.fill(0);
+      writeFileSync(authPath, content);
+      onDirectoryEvent?.();
+      const first = await memory.persistRefresh(auth("rotated-access", "rotated-refresh"), { expectedSnapshot });
+      expect(first).toMatchObject({ status: "retained" });
+      expect(timers).toHaveLength(1);
+      now = 60_999;
+      memory.observeNow();
+      const retained = memory.readMemory();
+      expect(retained.raw?.toString()).toContain("rotated-refresh");
+      retained.raw?.fill(0);
+      retained.snapshot?.raw.fill(0);
+      now = 61_000;
+      memory.observeNow();
+      const cleared = memory.readMemory();
+      expect(cleared.status).toBe("invalid");
+      expect(cleared.fileStatus).toBe("invalid");
+      expect(cleared.raw).toBeUndefined();
+      expect(cleared.deletionConfirmed).toBe(true);
+      expect(clearTimeoutCalls).toBe(1);
+      cleared.snapshot?.raw.fill(0);
+      timers[0]?.();
+      for (let i = 0; i < 12; i++) await Promise.resolve();
+      expect(writeCalls).toBe(0);
+      const afterRetry = memory.readMemory();
+      expect(afterRetry.raw).toBeUndefined();
+      afterRetry.snapshot?.raw.fill(0);
+      const second = await memory.persistRefresh(auth("rotated-access", "rotated-refresh"), { expectedSnapshot });
+      expect(second).toMatchObject({ status: "deleted" });
+      memory.stop();
+    }
+  });
+
+  test("a complete file inside the grace switches the login at once and ends the grace", async () => {
+    const store = await loadStoreModule();
+    let now = 1_000;
+    const memory = new store.NativeMainCredentialStore({ authPath, now: () => now, fileSystem: {
+      watchDirectory: (() => ({ close() {}, unref() {} })) as never,
+      setInterval: (() => ({ unref() {} })) as never,
+    } });
+    stores.push(memory);
+    writeFileSync(authPath, auth("access-a", "refresh-a", "account-a"));
+    memory.start();
+    unlinkSync(authPath);
+    memory.observeNow();
+    now = 60_000;
+    writeFileSync(authPath, auth("access-b", "refresh-b", "account-b"));
+    memory.observeNow();
+    const switched = memory.readMemory();
+    expect(switched.raw?.toString()).toContain("access-b");
+    expect(switched.fileStatus).toBe("valid");
+    expect(switched.graceActive).toBe(false);
+    expect(switched.deletionConfirmed).toBe(false);
+    switched.raw?.fill(0);
+    switched.snapshot?.raw.fill(0);
+    now = 100_000;
+    unlinkSync(authPath);
+    memory.observeNow();
+    const restarted = memory.readMemory();
+    expect(restarted.raw?.toString()).toContain("access-b");
+    restarted.raw?.fill(0);
+    restarted.snapshot?.raw.fill(0);
+    now = 159_999;
+    memory.observeNow();
+    const beforeExpiry = memory.readMemory();
+    expect(beforeExpiry.raw?.toString()).toContain("access-b");
+    beforeExpiry.raw?.fill(0);
+    beforeExpiry.snapshot?.raw.fill(0);
+    now = 160_000;
+    memory.observeNow();
+    const expired = memory.readMemory();
+    expect(expired.status).toBe("missing");
+    expect(expired.raw).toBeUndefined();
+    expired.snapshot?.raw.fill(0);
+  });
+
+  test("logout: a deleted auth.json with no new file clears the login after the configured grace", async () => {
+    writeFileSync(getConfigPath(), JSON.stringify({ ...getDefaultConfig(), nativeMainAuthGraceSeconds: 1 }));
+    writeFileSync(authPath, auth("access-good"));
+    expect(getMainAccountToken()?.accessToken).toBe("access-good");
+    unlinkSync(authPath);
+    const first = observeNativeMainAuthFile(authPath);
+    expect(first.status).toBe("ok");
+    first.raw?.fill(0);
+    first.snapshot?.raw.fill(0);
+    const retained = getMainAccountToken();
+    expect(retained?.accessToken).toBe("access-good");
+    await Bun.sleep(1_100);
+    const second = observeNativeMainAuthFile(authPath);
+    expect(second.status).toBe("missing");
+    expect(second.raw).toBeUndefined();
+    second.snapshot?.raw.fill(0);
+    expect(getMainAccountToken()).toBeNull();
+  });
+
   test("the native auth IO override stays under central synchronous evidence capture", async () => {
     const storeModule = await loadStoreModule();
     const original = auth("access-old");

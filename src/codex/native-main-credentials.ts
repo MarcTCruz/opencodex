@@ -12,6 +12,8 @@ import {
   type Stats,
 } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { loadConfig } from "../config";
+import { resolveNativeMainAuthGraceMs } from "../config/schema/native-main-auth-grace";
 import {
   atomicWriteFile,
   atomicWriteFileAsync,
@@ -142,6 +144,7 @@ export interface NativeMainCredentialFileSystem {
 export interface NativeMainCredentialStoreOptions {
   authPath: string;
   now?: () => number;
+  graceMs?: number;
   fileSystem?: Partial<NativeMainCredentialFileSystem>;
   writeSyncIO?: AtomicWriteIO;
   writeAsyncIO?: AtomicWriteAsyncIO;
@@ -184,7 +187,6 @@ type ObservationContent =
 
 interface NativeMainAuthObservation {
   readonly existence: ObservationExistence;
-  readonly witnessedPresence: boolean;
   readonly leafProvenance: NativeMainAuthLeafProvenance;
   readonly content: Readonly<ObservationContent>;
   readonly statSignature: Readonly<NativeMainAuthPhysicalSignature> | null;
@@ -615,6 +617,7 @@ export class NativeMainCredentialStore {
   private readonly writeSyncIO?: AtomicWriteIO;
   private readonly writeAsyncIO?: AtomicWriteAsyncIO;
   private readonly claimExclusive: typeof withNativeMainExclusiveClaim;
+  private readonly graceMs: number;
   private observationError: string | undefined;
   private memory: NativeMainAuthSnapshot | null = null;
   private disk: NativeMainAuthSnapshot | null = null;
@@ -630,7 +633,7 @@ export class NativeMainCredentialStore {
     latestObservation: null as NativeMainAuthObservation | null,
     lastCompleteChangeGeneration: 0,
     lastHiccupGeneration: 0,
-    deletionStartedAt: null as number | null,
+    notCompleteSince: null as number | null,
     deletionConfirmed: false,
     observationHistory: [] as ObservationHistoryEntry[],
     observationHistoryFloor: 0,
@@ -657,6 +660,7 @@ export class NativeMainCredentialStore {
     this.writeSyncIO = options.writeSyncIO;
     this.writeAsyncIO = options.writeAsyncIO;
     this.claimExclusive = options.claimExclusive ?? withNativeMainExclusiveClaim;
+    this.graceMs = options.graceMs ?? NATIVE_MAIN_AUTH_DELETE_GRACE_MS;
   }
 
   start(): void {
@@ -736,7 +740,6 @@ export class NativeMainCredentialStore {
       }
       return Object.freeze({
         existence,
-        witnessedPresence,
         leafProvenance,
         content,
         statSignature: signature,
@@ -746,7 +749,6 @@ export class NativeMainCredentialStore {
       });
     };
     const unreadable = (error: string) => Object.freeze({ kind: "unreadable" as const });
-    let witnessedPresence = false;
     let targetStat: Stats | null = null;
     let statFailure: unknown;
     try {
@@ -754,7 +756,6 @@ export class NativeMainCredentialStore {
     } catch (error) {
       statFailure = error;
     }
-    if (targetStat) witnessedPresence = true;
     let leafStat: Stats | null = null;
     let leafFailure: unknown;
     try {
@@ -762,7 +763,6 @@ export class NativeMainCredentialStore {
     } catch (error) {
       leafFailure = error;
     }
-    if (leafStat) witnessedPresence = true;
     const leafProvenance: NativeMainAuthLeafProvenance = leafStat
       ? leafStat.isSymbolicLink() ? "link" : leafStat.isFile() ? "regular" : "unknown"
       : "unknown";
@@ -793,7 +793,6 @@ export class NativeMainCredentialStore {
       } else {
         bytes = Buffer.from(read, "utf8");
       }
-      witnessedPresence = true;
     } catch (error) {
       const code = errnoCode(error);
       return finish("present", leafProvenance, unreadable(code === "ENOENT" ? "read-missing" : "read-failed"), initialSignature, "read-failed");
@@ -811,7 +810,6 @@ export class NativeMainCredentialStore {
     } catch (error) {
       currentStatFailure = error;
     }
-    if (currentStat) witnessedPresence = true;
     let currentLeafStat: Stats | null = null;
     let currentLeafFailure: unknown;
     try {
@@ -819,7 +817,6 @@ export class NativeMainCredentialStore {
     } catch (error) {
       currentLeafFailure = error;
     }
-    if (currentLeafStat) witnessedPresence = true;
     if (!currentStat || !currentLeafStat) {
       bytes.fill(0);
       const currentProvenance: NativeMainAuthLeafProvenance = currentLeafStat
@@ -843,6 +840,7 @@ export class NativeMainCredentialStore {
   }
 
   private applyObservationTransition(record: NativeMainAuthObservation): NativeMainAuthMemoryRead {
+    const at = this.now();
     const previousRecord = this.observationLedger.latestObservation;
     const signatureChanged = physicalSignatureKey(previousRecord?.statSignature ?? null)
       !== physicalSignatureKey(record.statSignature);
@@ -867,13 +865,6 @@ export class NativeMainCredentialStore {
     this.observationError = record.error;
     this.leafProvenance = record.leafProvenance;
     this.isSymlink = record.leafProvenance === "link";
-    if (record.witnessedPresence || record.existence === "present") {
-      this.observationLedger.deletionStartedAt = null;
-      this.observationLedger.deletionConfirmed = false;
-    } else if (record.existence === "unknown") {
-      this.observationLedger.deletionStartedAt = null;
-      this.observationLedger.deletionConfirmed = false;
-    }
     const historyKind: ObservationHistoryEntry["kind"] = record.existence === "absent"
       ? "missing" : record.content.kind === "complete" ? "complete"
         : record.content.kind === "invalid" || record.content.kind === "incomplete" ? "invalid" : "unknown";
@@ -903,16 +894,19 @@ export class NativeMainCredentialStore {
       this.observationLedger.lastHiccupGeneration = this.observationLedger.observationGeneration;
       this.disk?.raw.fill(0);
       this.disk = null;
-    }
-    if (record.existence === "absent") {
-      this.fileStatus = "missing";
-      if (this.observationLedger.deletionStartedAt === null) this.observationLedger.deletionStartedAt = this.now();
-      if (this.now() - this.observationLedger.deletionStartedAt >= NATIVE_MAIN_AUTH_DELETE_GRACE_MS) {
+      this.observationLedger.notCompleteSince ??= at;
+      if (at - this.observationLedger.notCompleteSince >= this.graceMs) {
         this.observationLedger.deletionConfirmed = true;
         this.clearMemory();
         this.pendingRefresh = null;
         this.clearRetryTimer();
       }
+    } else {
+      this.observationLedger.notCompleteSince = null;
+      this.observationLedger.deletionConfirmed = false;
+    }
+    if (record.existence === "absent") {
+      this.fileStatus = "missing";
       return this.readMemory();
     }
     if (record.existence === "unknown") {
@@ -974,9 +968,7 @@ export class NativeMainCredentialStore {
   }
 
   readMemory(): NativeMainAuthMemoryRead {
-    const graceActive = this.fileStatus === "missing"
-      && this.observationLedger.deletionStartedAt !== null
-      && !this.observationLedger.deletionConfirmed;
+    const graceActive = this.observationLedger.notCompleteSince !== null && !this.observationLedger.deletionConfirmed;
     const status = this.stopped ? "stopped"
       : this.memory ? "ok" : this.fileStatus === "valid" ? "unreadable" : this.fileStatus;
     const snapshot = snapshotCopy(this.memory ?? undefined);
@@ -1547,7 +1539,7 @@ function storeFor(path: string): NativeMainCredentialStore {
   const target = resolve(path);
   let store = stores.get(target);
   if (!store) {
-    store = new NativeMainCredentialStore({ authPath: target });
+    store = new NativeMainCredentialStore({ authPath: target, graceMs: resolveNativeMainAuthGraceMs(loadConfig()) });
     stores.set(target, store);
     if (didRunOptionalShutdownHooks()) {
       store.stop();

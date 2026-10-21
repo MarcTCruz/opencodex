@@ -12,6 +12,7 @@ import {
   validateConfigCandidate,
 } from "../../src/config";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { resolveNativeMainAuthGraceMs } from "../../src/config/schema/native-main-auth-grace";
 
 let home = "";
 let previousHome: string | undefined;
@@ -549,4 +550,35 @@ test("a malformed Aside profile sync policy warns once without echoing it and ke
       expect(warn.mock.calls.flat().join("\n")).not.toContain("asideProfileSync");
     }
   } finally { warn.mockRestore(); }
+});
+
+test("load keeps a valid nativeMainAuthGraceSeconds and ignores an invalid one with a warning", () => {
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    writeFileSync(getConfigPath(), JSON.stringify({ ...getDefaultConfig(), nativeMainAuthGraceSeconds: 5 }), "utf8");
+    const loaded = loadConfig();
+    expect(loaded.nativeMainAuthGraceSeconds).toBe(5);
+    expect(resolveNativeMainAuthGraceMs(loaded)).toBe(5_000);
+    writeFileSync(getConfigPath(), JSON.stringify(getDefaultConfig()), "utf8");
+    expect(resolveNativeMainAuthGraceMs(loadConfig())).toBe(60_000);
+    for (const invalid of [0, -1, 1.5, 86_401, "60"]) {
+      warn.mockClear();
+      writeFileSync(getConfigPath(), JSON.stringify({ ...getDefaultConfig(), nativeMainAuthGraceSeconds: invalid }), "utf8");
+      const degraded = loadConfig();
+      expect(degraded.nativeMainAuthGraceSeconds).toBeUndefined();
+      expect(warn.mock.calls.flat().join("\n")).toContain("nativeMainAuthGraceSeconds");
+      expect(resolveNativeMainAuthGraceMs(degraded)).toBe(60_000);
+    }
+  } finally { warn.mockRestore(); }
+});
+
+test("config validation rejects nativeMainAuthGraceSeconds outside integers from 1 to 86400", () => {
+  for (const valid of [1, 60, 86_400]) {
+    expect(validateConfigCandidate({ ...getDefaultConfig(), nativeMainAuthGraceSeconds: valid }).ok).toBe(true);
+  }
+  for (const invalid of [0, -1, 1.5, 86_401, "60", NaN]) {
+    const result = validateConfigCandidate({ ...getDefaultConfig(), nativeMainAuthGraceSeconds: invalid });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("schema_invalid: nativeMainAuthGraceSeconds");
+  }
 });

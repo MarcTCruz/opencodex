@@ -5,6 +5,7 @@ import { accountPauseStateSchema } from "./account-auto-pause";
 import { anthropicAccountPoolSchema } from "./anthropic-account-pool";
 import { compactionRecoverySchema } from "./compaction-recovery";
 import { nativeReasoningRetentionSchema } from "./native-reasoning-retention";
+import { nativeMainAuthGraceSecondsSchema } from "./native-main-auth-grace";
 import { desktopCompatibilitySchema } from "./desktop-compatibility";
 import { blockedModelRedirectsSchema } from "./blocked-model-redirects";
 import { mainAccountHardLockFallbackSchema } from "./main-account-hard-lock-fallback";
@@ -243,6 +244,8 @@ export const configSchema = z.object({
   codexMainAccountHardLockFallback: mainAccountHardLockFallbackSchema.optional().catch(undefined),
   // #2999: a malformed hand edit falls back to auto detection rather than rejecting the config.
   nativeMainRefresh: z.enum(["codex", "opencodex"]).optional().catch(undefined),
+  // Malformed hand edits fall back to the 60-second default; candidate writes reject them.
+  nativeMainAuthGraceSeconds: nativeMainAuthGraceSecondsSchema.optional().catch(undefined),
   // Future versions remain opaque through passthrough-compatible whole-config saves.
   // Only version 1 grants deletion authority in the rebase path.
   configRebaseProvenance: z.unknown().optional(),
