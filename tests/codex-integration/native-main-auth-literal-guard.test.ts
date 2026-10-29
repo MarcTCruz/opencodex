@@ -12,8 +12,8 @@ const ALLOWED: string[] = [
   "src/codex/desktop-compatibility/runtime.ts:133", // wires the identity reader of the module
   "src/codex/home.ts:170", // presence check, reads no bytes
   "src/codex/main-account.ts:215", // reads through readNativeMainAuthBytes of the module
-  "src/codex/native-profile-manager.ts:1089", // staged-home read through readNativeEnvelope of the module
-  "src/codex/native-profile-manager.ts:717", // staged-home cleanup, deletes instead of reading
+  "src/codex/native-profile-manager.ts:1090", // staged-home read through readNativeEnvelope of the module
+  "src/codex/native-profile-manager.ts:718", // staged-home cleanup, deletes instead of reading
   "src/codex/native-profile-store.ts:363", // context path; bytes read through readNativeMainAuthBytes
   "src/codex/orca-auth-source.ts:85", // Orca location validation, reads no bytes
   "src/codex/orca-import.ts:106", // native-main login path; bytes read through readNativeMainAuthBytes

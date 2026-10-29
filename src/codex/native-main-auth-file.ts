@@ -10,6 +10,7 @@ import {
   type BigIntStats,
 } from "node:fs";
 import { readBoundedLocalFile } from "./orca-auth-source";
+import { atomicWriteFile, type AtomicWriteHooks } from "../config/atomic-write";
 
 export const MAX_AUTH_BYTES = 4 * 1024 * 1024;
 
@@ -41,6 +42,16 @@ export function readNativeMainAuthBytesStable(path: string, maxBytes: bigint): {
   const after = statSync(path, { bigint: true });
   if (nativeAuthStatStamp(before) !== nativeAuthStatStamp(after)) throw new Error('Native credentials changed during read');
   return { bytes, stat: after };
+}
+
+/** The only sync writer of a native-main login file. */
+export function writeNativeMainAuthFile(path: string, content: string, hooks: AtomicWriteHooks): void {
+  atomicWriteFile(path, content, undefined, hooks);
+}
+
+/** The only async writer of a native-main login file. `write` keeps the caller's injected writer (a test seam of NativeProfileManager). */
+export async function writeNativeMainAuthFileAsync(path: string, content: string, write: (path: string, content: string) => Promise<void>): Promise<void> {
+  await write(path, content);
 }
 
 export function readBounded(path: string, limit: number, testSeam?: BoundedReadTestSeam): Buffer {
