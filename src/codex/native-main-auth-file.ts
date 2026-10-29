@@ -29,14 +29,17 @@ export function readNativeMainAuthBytes(path: string, mode: NativeMainAuthReadMo
   return Buffer.from(readBoundedLocalFile(path, limit ?? MAX_AUTH_BYTES), "utf8");
 }
 
+export function nativeAuthStatStamp(value: BigIntStats): string {
+  return `${value.dev}:${value.ino}:${value.size}:${value.mtimeNs}:${value.ctimeNs}`;
+}
+
 /** Reads with a stat before and after, as the desktop identity reader did. */
 export function readNativeMainAuthBytesStable(path: string, maxBytes: bigint): { bytes: Buffer; stat: BigIntStats } {
   const before = statSync(path, { bigint: true });
   if (before.size > maxBytes) throw new Error('Unexpected native auth size');
   const bytes = readFileSync(path);
   const after = statSync(path, { bigint: true });
-  const stamp = (value: BigIntStats) => `${value.dev}:${value.ino}:${value.size}:${value.mtimeNs}:${value.ctimeNs}`;
-  if (stamp(before) !== stamp(after)) throw new Error('Native credentials changed during read');
+  if (nativeAuthStatStamp(before) !== nativeAuthStatStamp(after)) throw new Error('Native credentials changed during read');
   return { bytes, stat: after };
 }
 

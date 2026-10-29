@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { readNativeMainAuthBytesStable } from '../native-main-auth-file';
+import { nativeAuthStatStamp, readNativeMainAuthBytesStable } from '../native-main-auth-file';
 import type { UsageIdentity } from './usage-controller';
 
 type Credential = { identity: UsageIdentity; accessToken: string };
@@ -12,9 +12,7 @@ export function createNativeIdentityReader(authPath: string, upstreamFetch: type
   const readCredential = (): Credential => {
     const { bytes, stat: after } = readNativeMainAuthBytesStable(authPath, 1048576n);
     const text = bytes.toString('utf8');
-    const stamp = (value: typeof after) =>
-      `${value.dev}:${value.ino}:${value.size}:${value.mtimeNs}:${value.ctimeNs}`;
-    const snapshot = `${stamp(after)}:${createHash('sha256').update(text).digest('hex')}`;
+    const snapshot = `${nativeAuthStatStamp(after)}:${createHash('sha256').update(text).digest('hex')}`;
     if (snapshot !== previousSnapshot) { previousSnapshot = snapshot; generation++; }
     const auth = JSON.parse(text);
     if (auth.auth_mode !== 'chatgpt' || typeof auth.tokens?.id_token !== 'string'
